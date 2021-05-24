@@ -1,9 +1,18 @@
 ;
 ;*******************************************************************
 ;
+;**************  Original Version *********************************
+;* Small/Shell: Version 1.0
+;*              A command processor for North Star DOS
+;*
+;* Copyright    1981  J. E. Hendrix
+;*              All rights reserved
+;
+;* Written for PDS assembler
+;*************  TMS 9900 Version  *******************************************
+;
 ;	SHELL VER 2.0.00
 ;	FOR THE TMS9900 SERIES COMPUTER
-;	ORIGINAL VERSION 1983 TO 1985
 ;	MODERN REVS	
 ;	01. ADDED FILENAME EXTENSION HANDLING 4 JUNE 2010
 ;	V2  ADDED INTERNAL COMMANDS, DIR, SAVE, ERA
@@ -66,7 +75,7 @@ SHELL:	EQU	0CA00H
 
 
 	AORG	SHELL
-STACKP  	EQU	$-2		;STACK LOCATION
+STACKP	EQU	$-2		;STACK LOCATION
 
 ;SET LOCATION OF STACK.  SHELL ALLOCATES STACK FOR ALL PROGRAMMES
 ;

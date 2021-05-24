@@ -1,5 +1,5 @@
 # Small-Shell-for-the-TMS9900
-A small Shell programme to front end the disc and io monitor and to complete the DOS.
+A small Shell programme is a Command Processor for the DOS.  Its purpose is to provide the user interface to allow interaction with the DOS.
 
 It is based on James Hendrix 8080 code written as Small VM/Shell to complement North Star DOS and was featured in a 1980s article in Dr Dobb's https://ia600109.us.archive.org/17/items/dr_dobbs_journal_vol_07_201803/dr_dobbs_journal_vol_07.pdf
 

@@ -19,4 +19,4 @@ The Shell prompts with the % character.
   
      Example, %SAVE 6 XMODEM -0100 will save 3k of data located at address 0100H to disc.   
 
-**%.FileName**  -> Load the File named by FileName into memory and returns to Shell.  This is useful if you wish to inspect the disc file or patch it.
+**%.FileName**  -> Placing a full stop in front of the filename loads file into memory and returns to Shell.  This is useful if you wish to inspect the disc file or patch it.

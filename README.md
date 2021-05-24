@@ -11,11 +11,11 @@ The Shell prompts with the % character.
 %DIR  -> List the DOS directory.
 %ERA <FileName> -> Erases a file from the DOS directory.
   
-  Example, ERA TEST.TXT will erase the file TEST.TXT from the disc.
+      Example, ERA TEST.TXT will erase the file TEST.TXT from the disc.
   
 %SAVE <N> <FileName> <-LOAD ADDRESS> -> Saves the contents of memory (normally and executable) at the <LOAD ADDRESS> to disc.  <N> 512 bytes
   sectors are written.
   
-  Example, %SAVE 6 XMODEM -0100 will save 3k of data located at address 0100H to disc.   
+     Example, %SAVE 6 XMODEM -0100 will save 3k of data located at address 0100H to disc.   
 
 

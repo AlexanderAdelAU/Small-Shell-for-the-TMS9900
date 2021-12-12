@@ -23,9 +23,10 @@ The Shell prompts with the % character.
     
 You can then execute the programme by simply typing the name of the saved programme, in this case:
   
-  **%XMODEM -> Executes the programme.
+     **%XMODEM** -> Executes the programme.
 
-and 
-  **%.XMODEM**  -> Just loads the programme into memory.   
+and
+  
+     **%.XMODEM**  -> Just loads the programme into memory.   
   
 Placing a full stop in front of the filename loads file into memory and returns to Shell.  This is useful if you wish to inspect the disc file or patch it.

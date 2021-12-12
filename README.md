@@ -16,7 +16,12 @@ The Shell prompts with the % character.
   
 **%SAVE**  N  FileName -Load Address  -> Saves the contents of memory (normally and executable) at the
   <LOAD ADDRESS> to disc.  N * 512 bytes are written to disc.
+
   
      Example, %SAVE 6 XMODEM -0100 will save 3k of data located at address 0100H to disc.   
+  
+    
+You can then execute the programme by simply typing the name of the saved programme, in this case:
+  **%XMODEM -> Executes the programme.
 
-**%.FileName**  -> Placing a full stop in front of the filename loads file into memory and returns to Shell.  This is useful if you wish to inspect the disc file or patch it.
+and **%.XMODEM**  -> Just loads the programme into memory.   Placing a full stop in front of the filename loads file into memory and returns to Shell.  This is useful if you wish to inspect the disc file or patch it.

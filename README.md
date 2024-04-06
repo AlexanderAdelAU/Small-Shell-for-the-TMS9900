@@ -21,9 +21,9 @@ The Shell prompts with the % character.
      Example, %SAVE 6 XMODEM -0100 will save 3k of data located at address 0100H to disc.   
   
     
-You can then execute the programme by simply typing the name of the saved programme, in this case:
+You can then execute the programme by simply typing the name of the saved programme, using XMODEM as an example, then in this case:
   
-     %XMODEM -> Executes the programme.
+     %XMODEM NAMEOFFILE -> Executes the programme.
 
 and
   

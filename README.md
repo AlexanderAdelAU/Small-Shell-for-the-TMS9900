@@ -23,7 +23,7 @@ The Shell prompts with the % character.
     
 You can then execute the programme by simply typing the name of the saved programme, using XMODEM as an example, then in this case:
   
-     %XMODEM NAMEOFFILE -> Executes the programme.
+     %XMODEM FileName -> Executes the programme to receive a file and which will save it to disc with the name 'FileName'.
 
 and
   

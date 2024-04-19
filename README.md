@@ -8,9 +8,9 @@ the Shell incorporates additonal CPM type commands such as DIR, SAVE and ERA.
 
 The Shell prompts with the % character.
 
-**%DIR**  -> List the DOS directory.
+**%DIR**  -> List the disc directory.
 
-**%ERA** FileName -> Erases a file from the DOS directory.
+**%ERA** FileName -> Erases a file from the disc directory.
   
       Example, ERA TEST.TXT will erase the file TEST.TXT from the disc.
   

@@ -18,8 +18,8 @@
                         ;	02  ADDED INTERNAL COMMANDS, DIR, SAVE, ERA
                         ;	04  LOAD ADDRESS HEADER ADDED SO MODULES CAN BE LOADED IN OTHER MEMORY SEGMENTS
                         ;
-                        ;	SHELL VER 3.0
-                        ;	ALIGN VERSIONS WITH BDOS ETC UP TO VERSION 3
+                        ;	SHELL VER 4.0
+                        ;	ALIGN VERSIONS WITH BDOS ETC UP TO VERSION 4
                         ;
                         ;*********************************************************************
                         ;
@@ -66,19 +66,22 @@
   F000                  MONITOR:	EQU	0F000H
                         
                         ;
-                        ; SET UP STACK SPACE
+                        ; SET UP STACK SPACE AND WORKSPACE
                         ;
-  C2E0                  	AORG	SHELL - 32
-  C2E0                  	BSS	32
+  0230                  WORKSP:	EQU	0230H
+  0500                  STACKP:	EQU	0500H
+  0500                  TPA:	EQU	0500H
+                        ;	AORG	SHELL - 32
+                        ;	BSS	32
                         	;
                         ;SET LOCATION OF STACK.  SHELL ALLOCATES STACK FOR ***ALL PROGRAMMES**
                         ;
-  C2FE                  STACKP:	EQU	$ - 2		;JUST SITS ON TOP OF SHELL ENTRY
-  0500                  TPA:	EQU	0500H
+                        ;STACKP:	EQU	$ - 2		;JUST SITS ON TOP OF SHELL ENTRY
+                        ;TPA:	EQU	0500H
                         ;
                         ; SHELL ENTRY POINT
                         ;
-                        
+  C300                  	AORG	SHELL
   C300   0460 C31A      	B	@INIT		;COLD START
                         ;
                         ;LOW MEMORY GLOBALS ETC
@@ -93,7 +96,6 @@
   0084                  BDOSV:	EQU	84H		;BDOS VECTORS (Workspace vector is not used)
                         ;
   0040                  CLSZ:	EQU	64		;MAX LENGTH OF COMMAND LINE
-                        ;TPA:	EQU	0100H		;DEFAULT RUN ADDRESS
   0200                  BYTSEC:	EQU	512		;BYTES/SECTOR
                         
                         ;
@@ -170,8 +172,8 @@
                         ;	HAVE COME HERE THROUGH A WARM BOOT/MONITOR AND THAT INTERRUPT VECTORS ARE SET
                         ;
   C319   00             	EVEN
-  C31A   02E0 CFC2      INIT	LWPI	WORKSP		;THIS WORKSPACE IS USED BY ALL LOADED PROGRAMMES
-  C31E   020A C2FE      	LI	SP,STACKP		;STACK LOCATION
+  C31A   02E0 0230      INIT	LWPI	WORKSP		;THIS WORKSPACE IS USED BY ALL LOADED PROGRAMMES
+  C31E   020A 0500      	LI	SP,STACKP		;STACK LOCATION
   C322   04CF           	CLR	R15		;CLEAR STATUS
   C324   D820 C30C      	MOVB	@CR,@CMDLINE		;NO AUTOBOOT AT PRESENT
   C328   CC58           
@@ -275,7 +277,7 @@
   C3C8   0202 000E      	LI	R2,SELDSK
   C3CC   2DA0 D100      	CALL	@BDOS
   C3D0   0203 CC58      	LI	R3,CMDLINE	 	;R3->FILENAME
-  C3D4   0204 CFE2      DLOOK1	LI	R4,FCB	 	;POINT TO FCB
+  C3D4   0204 CFC2      DLOOK1	LI	R4,FCB	 	;POINT TO FCB
   C3D8   0202 000B      	LI	R2,NAMSIZ 		;NAME LENGTH
   C3DC   9813 C309      DLOOK2	CB	*R3,@SPACE
   C3E0   1212           	JLE	DLOOK3	 	;NON GRAPHIC
@@ -304,17 +306,17 @@
   C40A   0602           	DEC	R2
   C40C   16FC           	JNE	DLOOK3
   C40E   2DA0 C5D6      DLOOK4	CALL	@ICMD		;LOOK FOR INTERNAL COMMAND
-  C412   0203 CFE2      	LI	R3,FCB	 	;SET FDC PTR
+  C412   0203 CFC2      	LI	R3,FCB	 	;SET FDC PTR
   C416   0202 0011      	LI	R2,SEARCH1		;SEARCH RETURNS WITH R3->DIRECTORY ENTRY
   C41A   2DA0 D100      	CALL	@BDOS	 	;TRY TO FIND A FILE
   C41E   C041           	MOV	R1,R1	 	;SUCCESS ?
   C420   111E           	JLT	LOOKERR		;NO FILES ON DISC
   C422   0202 000F      	LI	R2,FOPEN		;SEARCH RETURNS WITH R3->DIRECTORY ENTRY
-  C426   0203 CFE2      	LI	R3,FCB
+  C426   0203 CFC2      	LI	R3,FCB
   C42A   2DA0 D100      	CALL	@BDOS		;OPEN FILE
   C42E   C041           	MOV	R1,R1		;FOUND?
   C430   1116           	JLT	LOOKERR	 	;NO
-  C432   0204 CFE2      	LI	R4,FCB
+  C432   0204 CFC2      	LI	R4,FCB
   C436   C103           	MOV	R3,R4		;COPY FCB
   C438   C824 000E      	MOV	@FSZ(R4),@MFSZ 		;FILE SIZE
   C43C   CCB0           
@@ -345,7 +347,7 @@
                         ;		NZ NON ZERO, ASSUME LOAD ADDRESS AND LOAD TO THIS ADDRESS
                         ;
                         
-  C468   0204 CFE2      LOAD3	LI	R4,FCB
+  C468   0204 CFC2      LOAD3	LI	R4,FCB
   C46C   C0E4 0010      	MOV	@FLA(R4),R3		;GET LOAD ADDRESS
   C470   1302           	JEQ	LOAD4
   C472   0583           	INC	R3		;IS IT -1?
@@ -357,7 +359,7 @@
                         	; IF FLA = -1  CALL MLOAD
                         	;
   C47C   0202 001B      LOAD5	LI	R2,MLOAD		;FIRST MODULE ALWAYS LOADS AT 0500H
-  C480   0203 CFE2      	LI	R3,FCB
+  C480   0203 CFC2      	LI	R3,FCB
   C484   2DA0 D100      	CALL	@BDOS		;BDOS WILL RETURN FREEMEM IN R3
   C488   1016           	JMP	LOAD1
                         ;
@@ -367,7 +369,7 @@
   C494   0202 001A      	LI	R2,SETDMA
   C498   2DA0 D100      	CALL	@BDOS
   C49C   0202 0014      	LI	R2,RDSEQ 		;LOAD THE FILE
-  C4A0   0203 CFE2      	LI	R3,FCB
+  C4A0   0203 CFC2      	LI	R3,FCB
   C4A4   2DA0 D100      	CALL	@BDOS
   C4A8   2E43           	POP	R3	 	;POP DMA ADDR
   C4AA   0281 FFFF      	CI	R1,-1		;LOOK FOR EOF
@@ -408,8 +410,8 @@
                         ;	NOTE NEED TO RESTORE WP POINTERS ETC
                         ;
   C4E6   D801 CC56      RETURN	MOVB	R1,@CMDLINE-2
-  C4EA   02E0 CFC2      	LWPI	WORKSP		;REINITIALSE WORKSPACE AND STACK POINTERS
-  C4EE   020A C2FE      	LI	SP,STACKP
+  C4EA   02E0 0230      	LWPI	WORKSP		;REINITIALSE WORKSPACE AND STACK POINTERS
+  C4EE   020A 0500      	LI	SP,STACKP
   C4F2   04CF           	CLR	R15		;CLEAR STATUS
   C4F4   D060 CC56      	MOVB	@CMDLINE-2,R1
   C4F8   0881           	SRA	R1,8
@@ -518,7 +520,7 @@
   C5D5   00             	EVEN
                         ;	
   C5D6   0201 C5B4      ICMD	LI	R1,ICLIST
-  C5DA   0203 CFE2      	LI	R3,FCB		;NAME OF COMMAND
+  C5DA   0203 CFC2      	LI	R3,FCB		;NAME OF COMMAND
   C5DE   0205 0004      	LI	R5,CMDCNT	;NUMBER OF INTERNAL COMMANDS
   C5E2   9C73           ICMD0	CB	*R3+,*R1+
   C5E4   13FE           	JEQ	ICMD0
@@ -547,7 +549,7 @@
   C606   D031           ICMD2	MOVB	*R1+,R0		; LOOK FOR TEMINATOR
   C608   16FE           	JNE	ICMD2
   C60A   05C1           	INCT	R1		;POINT TO NEXT COMMAND
-  C60C   0203 CFE2      	LI	R3,FCB		;R1 POINTS TO NEXT COMMAND
+  C60C   0203 CFC2      	LI	R3,FCB		;R1 POINTS TO NEXT COMMAND
   C610   10E8           	JMP	ICMD0
   C612   2DC0           ICMDE	RET			;RETURN 
                         ;
@@ -576,7 +578,7 @@
   C62C   C800 C626      	MOV	R0,@CCOUNT
   C630   0201 3F00      	LI	R1,'?'*256		;WILD CHARACTER
   C634   0200 000B      	LI	R0,NAMSIZ 		;FCB COUNTER
-  C638   0208 CFE2      	LI	R8,FCB	  		;
+  C638   0208 CFC2      	LI	R8,FCB	  		;
   C63C   C088           	MOV	R8,R2	 		;SAVE FCB
   C63E   DC81           DSKDIR0	MOVB	R1,*R2+	 		;STORE IN FCB
   C640   0600           	DEC	R0	 		;ANY MORE ALLOWED ?
@@ -585,7 +587,7 @@
                         ;	NOW SEARCH FOR FILES
                         ;
   C644   0202 0011      	LI	R2,SEARCH1		;SEARCH RETURNS WITH R3->DIRECTORY ENTRY
-  C648   0203 CFE2      	LI	R3,FCB
+  C648   0203 CFC2      	LI	R3,FCB
   C64C   2DA0 D100      	CALL	@BDOS	 		;TRY TO FIND A FILE
   C650   C041           	MOV	R1,R1	 		;SUCCESS ?
   C652   1132           	JLT	NOFILE			;NO FILES ON DISC
@@ -594,7 +596,7 @@
                         ;	CONTINUE
                         ;
   C658   0202 0012      DSKDIR1	LI	R2,SEARCH2
-  C65C   0203 CFE2      	LI	R3,FCB
+  C65C   0203 CFC2      	LI	R3,FCB
   C660   2DA0 D100      	CALL	@BDOS
   C664   C041           	MOV	R1,R1
   C666   1123           	JLT	DIREXIT
@@ -686,7 +688,7 @@
   C710   0608           	DEC	R8	 	;BACK UP
   C712   C0C8           	MOV	R8,R3		;R3->NAME
   C714   0200 000B      	LI	R0,NAMSIZ 		;FCB COUNTER
-  C718   0208 CFE2      	LI	R8,FCB	  		;
+  C718   0208 CFC2      	LI	R8,FCB	  		;
   C71C   D620 C309      	MOVB	@SPACE,*R8		;FILL WITH SPACE
   C720   C088           	MOV	R8,R2	 		;SAVE FCB
   C722   9813 C309      NAM0	CB	*R3,@SPACE	 	;END OF NAME ?
@@ -723,20 +725,20 @@
                         ;	USE BDOS TO SEARCH FOR FILE
                         ;
   C766   0202 0011      NAMSRCH	LI	R2,SEARCH1		;SEARCH RETURNS WITH R3->DIRECTORY ENTRY
-  C76A   0203 CFE2      	LI	R3,FCB
+  C76A   0203 CFC2      	LI	R3,FCB
   C76E   2DA0 D100      	CALL	@BDOS	 	;TRY TO FIND A FILE
   C772   C041           	MOV	R1,R1	 	;SUCCESS ?
   C774   1106           	JLT	NAM5		;NO FILES ON DISC
   C776   0202 0013      NAM3	LI	R2,ERAFIL 		;PURGE IF ALREADY EXITS
-  C77A   0203 CFE2      	LI	R3,FCB
+  C77A   0203 CFC2      	LI	R3,FCB
   C77E   2DA0 D100      	CALL	@BDOS
   C782   0202 0016      NAM5	LI	R2,MAKFIL
-  C786   0203 CFE2      	LI	R3,FCB
+  C786   0203 CFC2      	LI	R3,FCB
   C78A   2DA0 D100      	CALL	@BDOS	 	;TRY TO MAKE THE FILE
   C78E   C041           	MOV	R1,R1	 	;SUCCESS ?
   C790   1171           	JLT	MKERR	 	;MAKE ERROR
   C792   04C0           	CLR	R0
-  C794   0204 CFE2      	LI	R4,FCB
+  C794   0204 CFC2      	LI	R4,FCB
   C798   D900 000B      	MOVB	R0,@FTY(R4)		;ZERO SAYS DONT CARE
   C79C   C0E0 C5D2      	MOV	@SADDR,R3		;START ADDRESS
   C7A0   C903 0010      	MOV	R3,@FLA(R4)		;EXECUTE ADDRESS
@@ -745,7 +747,7 @@
   C7AA   0202 001A      	LI	R2,SETDMA
   C7AE   2DA0 D100      	CALL	@BDOS
   C7B2   0202 0015      	LI	R2,WRSEQ
-  C7B6   0203 CFE2      	LI	R3,FCB
+  C7B6   0203 CFC2      	LI	R3,FCB
   C7BA   2DA0 D100      	CALL	@BDOS
   C7BE   2E43           	POP	R3	 	;POP ADDR
   C7C0   C041           	MOV	R1,R1	 	;WRITE ERROR ?
@@ -759,7 +761,7 @@
   C7CE   0620 C5D0      	DEC	@RECCNT	 	;FINISHED ?
   C7D2   16EA           	JNE	WRDATA		;YES
   C7D4   0202 0010      WRDATAC	LI	R2,FCLOSE	 	;NOW CLOSE THE FILE
-  C7D8   0203 CFE2      	LI	R3,FCB
+  C7D8   0203 CFC2      	LI	R3,FCB
   C7DC   2DA0 D100      	CALL	@BDOS
   C7E0   04C1           EXIT	CLR	R1		;RETURN CODE FOR SHELL
   C7E2   0460 C4E6      	B	@RETURN		;NEED TO CALL SHELL INIT BECAUSE WE HAVE ALTERED WP
@@ -791,7 +793,7 @@
   C812   0608           	DEC	R8	 		;BACK UP
   C814   C0C8           	MOV	R8,R3			;R3->NAME  
   C816   0200 000B      	LI	R0,NAMSIZ 		;FCB COUNTER
-  C81A   0208 CFE2      	LI	R8,FCB	  	;
+  C81A   0208 CFC2      	LI	R8,FCB	  	;
   C81E   D620 C309      	MOVB	@SPACE,*R8		;FILL WITH SPACE
   C822   C088           	MOV	R8,R2	 	;SAVE FCB
   C824   9813 C309      ERA1	CB	*R3,@SPACE	 	;END OF NAME ?
@@ -812,12 +814,12 @@
                         ;	USE BDOS TO SEARCH FOR FILE
                         ;
   C844   0202 0011      ERA4	LI	R2,SEARCH1		;SEARCH RETURNS WITH R3->DIRECTORY ENTRY
-  C848   0203 CFE2      	LI	R3,FCB
+  C848   0203 CFC2      	LI	R3,FCB
   C84C   2DA0 D100      	CALL	@BDOS	 	;TRY TO FIND A FILE
   C850   C041           	MOV	R1,R1	 	;SUCCESS ?
   C852   1108           	JLT	ERAE		;NO FILES ON DISC
   C854   0202 0013      	LI	R2,ERAFIL 		;PURGE IF ALREADY EXITS
-  C858   0203 CFE2      	LI	R3,FCB
+  C858   0203 CFC2      	LI	R3,FCB
   C85C   2DA0 D100      	CALL	@BDOS
   C860   C041           	MOV	R1,R1	 	;WRITE ERROR ?
   C862   1117           	JLT	MKERR2	 	;YES
@@ -850,7 +852,7 @@
   C890   1000           	JMP	MKERR2
                         	
   C892   0202 0010      MKERR2	LI	R2,FCLOSE		;TRY TO CLOSE THE FILE
-  C896   0203 CFE2      	LI	R3,FCB
+  C896   0203 CFC2      	LI	R3,FCB
   C89A   2DA0 D100      	CALL	@BDOS
   C89E   0460 C4E6      	B	@RETURN;
                         ;
@@ -969,7 +971,7 @@
   C98C   0203 CCC2      	LI	R3,MBUF	 			;USE THIS BUFFER
   C990   0202 001A      	LI	R2,SETDMA
   C994   2DA0 D100      	CALL	@BDOS	
-  C998   0203 CFE2      	LI	R3,FCB	
+  C998   0203 CFC2      	LI	R3,FCB	
   C99C   0202 0014      	LI	R2,RDSEQ	 		;READ 1 SECTOR<--
   C9A0   2DA0 D100      	CALL	@BDOS		 		;
   C9A4   C041           	MOV	R1,R1	 			;TROUBLE ?
@@ -1134,7 +1136,7 @@
   CB2A   16EC           	JNE	NESTERR	 		;YES,BUT CAN'T NEST THEM
   CB2C   0701           	SETO	R1	 		;NO,SET PROC SWITCH
   CB2E   C801 CC4A      	MOV	R1,@PROCSW	
-  CB32   0203 CFE2      	LI	R3,FCB			;SET PROC FDE FIELDS
+  CB32   0203 CFC2      	LI	R3,FCB			;SET PROC FDE FIELDS
   CB36   0204 CCA0      	LI	R4,MNAM			;DEST 
   CB3A   0202 0010      	LI	R2,16			; 
   CB3E   2DA0 CBF6      	CALL	@BMOVE	
@@ -1371,10 +1373,10 @@
   CF6A                  PPTRS	BSS	22	 	;11 WORDS 
   CF80                  PBUF	BSS	64	 	;PARM BUUFER 
   CFC0   0000           PPADDR	WORD	0		;ADDR OF CUR PARM PTR
-  CFC2                  WORKSP	BSS	32		;GENERAL SHELL WORKSPACE PASSED ONTO LOADED PROGRAMMES SO THAT THEY CAN RETURN
-  CFE2                  FCB	BSS	36 		;FCB MUST BE 36 BYTES LONG
+                        ;WORKSP	BSS	32		;GENERAL SHELL WORKSPACE PASSED ONTO LOADED PROGRAMMES SO THAT THEY CAN RETURN
+  CFC2                  FCB	BSS	36 		;FCB MUST BE 36 BYTES LONG
                         ;
-  D006                  	END	
+  CFE6                  	END	
 
 No error(s).
 LOOKERR          C45E  SUBLOOP2         CA44  MNAM             CCA0  SP               000A  
@@ -1382,7 +1384,7 @@ OUT0             CC30  GOLOOP           C4CC  EXIT             C7E0  CINLOOP    
 CCOUNT           C626  DLOOK1           C3D4  PARMSG           CF25  DLOOK2           C3DC  
 FTY              000B  DLOOK3           C406  MOVERR           CA1A  DLOOK4           C40E  
 NULLMSG          CEF8  DLOOK5           C3FE  R10              000A  DLOOK6           C3F2  
-ERA0             C7FE  DLOOK7           C3FA  ERA2             C838  FCB              CFE2  
+ERA0             C7FE  DLOOK7           C3FA  ERA2             C838  FCB              CFC2  
 ERA4             C844  EXTSIZ           0003  MNOFILE          C61B  FSB              000C  
 DSKSAVE          C6C6  R12              000C  NAM0             C722  OUTSTR           CC32  
 NAM2             C742  LOAD4            C476  NAM1             C736  MFTY             CCAE  
@@ -1409,15 +1411,15 @@ PROCSW           CC4A  LARGERR          C88C  CMDERR           CADC  RET        
 STRT01           C704  CHKSYS           C382  PUSHREG          2D00  NOTHEX           C902  
 PAD              0000  NOSUB            CA60  VSW              CC4E  BUFFSIZ          0200  
 NULLPARM         CA64  NESTMSG          CEFB  BS               C30B  BDOS             D100  
-NESTERR          CB04  ERRMSG2          C916  LADDR            CC54  RECCNT           C5D0  
-ERRMSG5          C946  CATOH            C8CE  GOPROG           C4C2  WORKSP           CFC2  
+NESTERR          CB04  ERRMSG2          C916  LADDR            CC54  WORKSP           0230  
+ERRMSG5          C946  CATOH            C8CE  GOPROG           C4C2  RECCNT           C5D0  
 WAITMSG          CF5C  ICMD0            C5E2  SYSFILE          C317  HDERR            0000  
 SUBLOOP          CA3C  DOPROC           CB26  COMT             C310  HARDERR          CAF8  
 STR0             CC3E  BUFMOVE          C9C6  NOFILE           C6B8  START00          C6DA  
 HARDMSG          CF4B  ECHO             C578  PUSH             2E00  LOAD             C462  
 CMDLINE          CC58  ICMDE            C612  NAM              0000  NULLERR          CAFE  
 LOAD2            C48A  RETURN           C4E6  PEOL             CA6A  MBUF             CCC2  
-PROM             C315  STACKP           C2FE  NAM5             C782  SETDMA           001A  
+PROM             C315  STACKP           0500  NAM5             C782  SETDMA           001A  
 ERA3             C83C  HDERRV           CC46  DOSERRV          CC48  LOAD5            C47C  
 LOOP             C8D0  NOTE             C314  RHEX             2EC0  SWITCH           C5D4  
 GOTONE           C8F4  NEXTCMD          C50E  READ             2F40  DDEN             0001  

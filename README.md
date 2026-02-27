@@ -2,7 +2,7 @@
 
 A small **Shell program** acting as a command processor for the DOS.\
 Its purpose is to provide a user interface that allows interaction with
-the operating system.
+the operating system.100
 
 This project is based on James Hendrix's 8080 Small VM/Shell, originally
 written to complement North Star DOS and featured in a 1982 article in
@@ -66,7 +66,7 @@ Saves the contents of memory (normally an executable) starting at
 
     %SAVE 6 XMODEM -0100
 
-Saves 3 KB (6 × 512 bytes) starting at address `0100H` to disk as
+Saves 3 KB (6 × 512 bytes) starting at address `0500H` to disk as
 `XMODEM`.
 
 ------------------------------------------------------------------------

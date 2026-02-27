@@ -1,32 +1,108 @@
 # Small-Shell-for-the-TMS9900
-A small Shell programme is a Command Processor for the DOS.  Its purpose is to provide the user interface to allow interaction with the DOS.
 
-It is based on James Hendrix 8080 code written as Small VM/Shell to complement North Star DOS and was featured in a 1982 article in Volume 7 of Dr Dobb's Journal (Vol 7 Number 63).  The article provides a full description of the procedural commands that are available. https://ia600109.us.archive.org/17/items/dr_dobbs_journal_vol_07_201803/dr_dobbs_journal_vol_07.pdf
+A small **Shell program** acting as a command processor for the DOS.\
+Its purpose is to provide a user interface that allows interaction with
+the operating system.
 
-This TMS9900 version uses the existing structure but has been recoded to run on a TMS9900 CPM like system, but 
-the Shell incorporates additonal CPM type commands such as DIR, SAVE and ERA. 
+This project is based on James Hendrix's 8080 Small VM/Shell, originally
+written to complement North Star DOS and featured in a 1982 article in
+Volume 7, Number 63 of Dr. Dobb's Journal.
 
-The Shell prompts with the % character.
+The original article (which provides a full description of the
+procedural commands) can be found here:
 
-**%DIR**  -> List the disc directory.
+https://ia600109.us.archive.org/17/items/dr_dobbs_journal_vol_07_201803/dr_dobbs_journal_vol_07.pdf
 
-**%ERA** FileName -> Erases a file from the disc directory.
-  
-      Example, ERA TEST.TXT will erase the file TEST.TXT from the disc.
-  
-**%SAVE**  N  FileName -Load Address  -> Saves the contents of memory (normally and executable) at the
-  <LOAD ADDRESS> to disc.  N * 512 bytes are written to disc.
+------------------------------------------------------------------------
 
-  
-     Example, %SAVE 6 XMODEM -0100 will save 3k of data located at address 0100H to disc.   
-  
-    
-You can then execute the programme by simply typing the name of the saved programme, using XMODEM as an example, then in this case:
-  
-     %XMODEM FileName -> Executes the programme to receive a file and which will save it to disc with the name 'FileName'.
+## TMS9900 Version
 
-and
-  
-     %.XMODEM  -> Just loads the programme into memory.   
-  
-Placing a full stop in front of the filename loads file into memory and returns to Shell.  This is useful if you wish to inspect the disc file or patch it.
+This version retains the original structure but has been rewritten to
+run on a **TMS9900 CP/M-like system**.
+
+In addition to the original functionality, this Shell incorporates
+additional CP/M-style commands such as:
+
+-   `DIR`
+-   `SAVE`
+-   `ERA`
+
+The Shell prompt is:
+
+    %
+
+------------------------------------------------------------------------
+
+## Commands
+
+### `%DIR`
+
+Lists the disk directory.
+
+------------------------------------------------------------------------
+
+### `%ERA FileName`
+
+Erases a file from the disk directory.
+
+**Example:**
+
+    %ERA TEST.TXT
+
+Erases the file `TEST.TXT` from the disk.
+
+------------------------------------------------------------------------
+
+### `%SAVE N FileName -HexLoadAddress`
+
+Saves the contents of memory (normally an executable) starting at
+`<HexLoadAddress>` to disk.
+
+-   `N` specifies how many blocks to write.
+-   Each block = 512 bytes.
+-   Total bytes written = `N × 512`.
+
+**Example:**
+
+    %SAVE 6 XMODEM -0100
+
+Saves 3 KB (6 × 512 bytes) starting at address `0100H` to disk as
+`XMODEM`.
+
+------------------------------------------------------------------------
+
+## Executing Programs
+
+Once saved, a program can be executed by typing its name.
+
+**Example:**
+
+    %XMODEM FileName
+
+Executes `XMODEM`, which receives a file and saves it to disk as
+`FileName`.
+
+------------------------------------------------------------------------
+
+### Load Only (Do Not Execute)
+
+Placing a full stop (`.`) in front of the filename loads the file into
+memory and returns to the Shell:
+
+    %.XMODEM
+
+This is useful for inspecting or patching a disk file without executing
+it.
+
+------------------------------------------------------------------------
+
+## Running in a Memory Segment Other Than 0
+
+To run a program in a different memory segment (for example, segment 1),
+specify the segment number using the `-` switch:
+
+    FileName -1
+
+When the Shell detects `-1`, it creates a loader in common memory.\
+This loader moves the object file into the specified segment before
+execution.

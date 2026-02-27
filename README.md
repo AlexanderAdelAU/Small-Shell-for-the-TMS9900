@@ -1,33 +1,70 @@
 # Small-Shell-for-the-TMS9900
 
-A small **Shell program** acting as a command processor for the DOS.\
-Its purpose is to provide a user interface that allows interaction with
-the operating system.100
+![Platform](https://img.shields.io/badge/CPU-TMS9900-blue)
+![OS](https://img.shields.io/badge/OS-CP/M--Like-green)
+![Language](https://img.shields.io/badge/Language-Assembly-orange)
+![Status](https://img.shields.io/badge/Status-Retro--Project-lightgrey)
+
+------------------------------------------------------------------------
+
+## Table of Contents
+
+-   [Overview](#overview)
+-   [Historical Background](#historical-background)
+-   [TMS9900 Version](#tms9900-version)
+-   [Shell Prompt](#shell-prompt)
+-   [Commands](#commands)
+    -   [%DIR](#dir)
+    -   [%ERA](#era-filename)
+    -   [%SAVE](#save-n-filename--hexloadaddress)
+-   [Executing Programs](#executing-programs)
+-   [Load Without Executing](#load-without-executing)
+-   [Running in Alternate Memory
+    Segments](#running-in-alternate-memory-segments)
+
+------------------------------------------------------------------------
+
+## Overview
+
+**Small-Shell-for-the-TMS9900** is a compact command processor for DOS
+on a TMS9900 CP/M-like system.
+
+It provides a simple and efficient user interface for interacting with
+the operating system and managing disk-based programs.
+
+------------------------------------------------------------------------
+
+## Historical Background
 
 This project is based on James Hendrix's 8080 Small VM/Shell, originally
-written to complement North Star DOS and featured in a 1982 article in
-Volume 7, Number 63 of Dr. Dobb's Journal.
+written to complement North Star DOS.
 
-The original article (which provides a full description of the
-procedural commands) can be found here:
+It was featured in a 1982 article in Volume 7, Number 63 of *Dr. Dobb's
+Journal*.\
+The original article provides a full description of the procedural
+command structure.
 
+Archived article:
 https://ia600109.us.archive.org/17/items/dr_dobbs_journal_vol_07_201803/dr_dobbs_journal_vol_07.pdf
 
 ------------------------------------------------------------------------
 
 ## TMS9900 Version
 
-This version retains the original structure but has been rewritten to
-run on a **TMS9900 CP/M-like system**.
+This version:
 
-In addition to the original functionality, this Shell incorporates
-additional CP/M-style commands such as:
+-   Preserves the original structure and design philosophy
+-   Has been rewritten for a **TMS9900 CP/M-like system**
+-   Adds CP/M-style disk commands:
+    -   `DIR`
+    -   `SAVE`
+    -   `ERA`
 
--   `DIR`
--   `SAVE`
--   `ERA`
+------------------------------------------------------------------------
 
-The Shell prompt is:
+## Shell Prompt
+
+The Shell prompt character is:
 
     %
 
@@ -39,70 +76,76 @@ The Shell prompt is:
 
 Lists the disk directory.
 
+Example:
+
+    %DIR
+
 ------------------------------------------------------------------------
 
 ### `%ERA FileName`
 
 Erases a file from the disk directory.
 
-**Example:**
+Example:
 
     %ERA TEST.TXT
-
-Erases the file `TEST.TXT` from the disk.
 
 ------------------------------------------------------------------------
 
 ### `%SAVE N FileName -HexLoadAddress`
 
-Saves the contents of memory (normally an executable) starting at
-`<HexLoadAddress>` to disk.
+Saves memory contents (typically an executable) to disk.
 
--   `N` specifies how many blocks to write.
--   Each block = 512 bytes.
--   Total bytes written = `N × 512`.
+-   `N` = number of 512-byte blocks
+-   Total bytes written = `N × 512`
+-   `HexLoadAddress` = starting address (hexadecimal)
 
-**Example:**
+Example:
 
     %SAVE 6 XMODEM -0100
 
-Saves 3 KB (6 × 512 bytes) starting at address `0500H` to disk as
+This writes 3 KB (6 × 512 bytes) starting at address `0100H` to disk as
 `XMODEM`.
 
 ------------------------------------------------------------------------
 
 ## Executing Programs
 
-Once saved, a program can be executed by typing its name.
-
-**Example:**
+After saving, execute a program by typing its name:
 
     %XMODEM FileName
 
-Executes `XMODEM`, which receives a file and saves it to disk as
+This example runs `XMODEM`, receives a file, and saves it to disk as
 `FileName`.
 
 ------------------------------------------------------------------------
 
-### Load Only (Do Not Execute)
+## Load Without Executing
 
-Placing a full stop (`.`) in front of the filename loads the file into
-memory and returns to the Shell:
+To load a program into memory without executing it, prefix the filename
+with a period:
 
     %.XMODEM
 
-This is useful for inspecting or patching a disk file without executing
-it.
+This loads the file into memory and returns to the Shell.\
+Useful for inspection or patching.
 
 ------------------------------------------------------------------------
 
-## Running in a Memory Segment Other Than 0
+## Running in Alternate Memory Segments
 
-To run a program in a different memory segment (for example, segment 1),
-specify the segment number using the `-` switch:
+By default, programs execute in segment 0.
+
+To run in another segment (e.g., segment 1):
 
     FileName -1
 
-When the Shell detects `-1`, it creates a loader in common memory.\
-This loader moves the object file into the specified segment before
-execution.
+When the Shell detects `-1`, it:
+
+1.  Creates a loader in common memory
+2.  Moves the object file into the specified segment
+3.  Transfers control for execution
+
+------------------------------------------------------------------------
+
+

@@ -1,0 +1,1716 @@
+                        ;
+                        ;*******************************************************************
+                        ;
+                        ;The New "Bridge" Memory Map
+                        ;Address	Content	Purpose
+                        ;>0230	SH_WP	Shell Workspace: R0-R15 for the active command processor.
+                        ;>0250	SH_CMD	Command Line: The raw input string from the user.
+                        ;>0280	CM_FCB	The FCB (36 Bytes): Now safely tucked below the buffer.
+                        ;>02A4	CM_VARS	Bridge Variables: Pointers, status flags, segment IDs.
+                        ;>0300	CM_BUF	The 512-byte Sector Buffer: Direct IDE mapping.
+                        ;
+                        ;
+                        ;*******************************************************************
+                        ;
+                        ;**************  Original Version *********************************
+                        ;* Small/Shell: Version 1.0
+                        ;*              A command processor for North Star DOS
+                        ;*
+                        ;* Copyright    1981  J. E. Hendrix
+                        ;*              All rights reserved
+                        ;
+                        ;* Written for PDS assembler
+                        ;*************  TMS 9900 Version  *******************************************
+                        ;
+                        ;	SHELL VER 4.0.00
+                        ;	FOR THE TMS9900 SERIES COMPUTER
+                        ;	MODERN REVS	
+                        ;	4.1 ADDED FILENAME EXTENSION HANDLING 4 JUNE 2010
+                        ;	4.6  ADDED INTERNAL COMMANDS, DIR, SAVE, ERA
+                        ;	4.7 REFLECTS MULTISEGMENT ALIGNMENT TO OTHER APPLICATIONS AND THE REQUIREMENT FOR
+                        ;	    RETURNS TO SHELL TO BE RETF.
+                        ;
+                        ;
+                        ;*********************************************************************
+                        ;
+                        
+  0000                  R0	EQU	0
+  0001                  R1	EQU	1
+  0002                  R2	EQU	2
+  0003                  R3	EQU	3
+  0004                  R4	EQU	4
+  0005                  R5	EQU	5
+  0006                  R6	EQU	6
+                        ;R7	EQU	7   CAN'T USE R7 AS IT IS RESERVED
+  0008                  R8	EQU	8
+  0009                  R9	EQU	9
+  000A                  R10	EQU	10
+  000B                  R11	EQU	11
+  000C                  R12	EQU	12
+  000D                  WP	EQU	13
+  000E                  R14	EQU	14
+  000F                  R15	EQU	15
+  000A                  SP	EQU	10
+                        ;
+                        ;----Define  Extended Operations
+                        ;
+                        ;	DEFINE SOME XOP'S
+                        ;
+                        	DXOP	FAR_REF,0
+                        ;	DXOP	SETREG,2
+                        	DXOP	CALL_FAR,3
+                        	DXOP	PUSHREG,4
+                        	DXOP	POPREG,5	
+                        	DXOP	CALL,6
+                        	DXOP	RET,7
+                        	DXOP	PUSH,8
+                        	DXOP	POP,9
+                        	DXOP	WHEX,10		;WRITE OUT A 16 BIT HEX VALUE
+                        	DXOP	RHEX,11		;READ IN A 16 BIT HEX VALUE
+                        	DXOP	WRITE,12		;WRITE CHAR IN MSB
+                        	DXOP	READ,13		;READ CHAR IN MSB
+                        	DXOP	MESG,14		;OUTPUT NULL TERMINATED MESSAGE
+                        	DXOP	DEBUG,15
+                        ;
+                        ; OPERATING SYSTEM EQUATES
+                        
+                        ;
+  C300                  SHELL:	EQU	0C300H
+  D100                  BDOS:	EQU	0D100H
+  F000                  MONITOR:	EQU	0F000H		;MONITOR REFERENCE
+  F004                  BANNER:	EQU	MONITOR + 4		;RETURN TO BANNER IF NO MONITOR INITIALISATION
+                        
+                        ;
+                        ; SET UP STACK SPACE AND WORKSPACE AND COMMAND LINE
+                        ;
+  0230                  WORKSP:	EQU	0230H		;APP WORKSPACE.  MONITOR USED 230H
+                        ;STACKP:	EQU	0500H		; WAS SHELL
+  EF00                  STACKP:	EQU	MONITOR-0100H
+  0500                  TPA:	EQU	0500H
+  0250                  CMDLINE:	EQU	0250H		;ALL APPS USE THIS
+  10FF                  HALT:	EQU	10FFH		;HALT MACRO
+  0300                  COMM_BUF:	EQU	0300H		;COMMON BRIDGE BUFFER
+  0280                  COMM_FCB:	EQU	0280H		;FCB BUFFER IN COMMON
+  0280                  FCB:	EQU	COMM_FCB
+                        ;
+                        ; SHELL ENTRY POINT
+                        ;
+  C300                  	AORG	SHELL
+  C300   0460 C31A      	B	@INIT		;COLD START
+                        ;
+                        ;LOW MEMORY GLOBALS AND POINTERS ETC
+                        ;
+  00A0                  CMDL_PTR:	EQU	0A0H		;ADDRESS OF SYSTEM COMMAND LINE
+  00A2                  CMDL_SIZE:	EQU	0A2H		;WORD HOLDS THE LENGTH OF THE COMMAND LINE
+  00A4                  BUFF_PTR: 	EQU	0A4H		;ADDRESS OF SYSTEM BUFFER
+  00A8                  LBA:	EQU	0A8H		;TWO WORDS (4 BYTES) USED BY MONITOR
+  00AC                  FCB_PTR:	EQU	0ACH
+  00A6                  FREEMEM:	EQU	0A6H		;FREE MEMORY ADDRESS - USED IN MONITOR
+  00B0                  MEMLIMIT:	EQU	0B0H		;THIS IS THE BOTTOM OF TPA
+  0200                  BUFFSIZ:	EQU	512		;ADD TWO BYTES AS A SAFETY BUFFER
+                        ;
+  0080                  SHELL_PTR:	EQU	80H		;SHELL VECTORS, NOTE THIS IS THE ADDRESS
+  0084                  BDOS_PTR:	EQU	84H		;BDOS VECTORS (Workspace vector is not used)
+  0400                  LOADER:	EQU	0400H		;ADDRESS OF LOADER- MUST BE IN COMMON;
+  0040                  CLSZ:	EQU	64		;MAX LENGTH OF COMMAND LINE
+  0200                  BYTSEC:	EQU	512		;BYTES/SECTOR
+  0780                  LDS:	EQU	0780H		;Long Distance Source instruction operand.
+  07C0                  LDD:	EQU	07C0H		;Long Distance Destination instruction operand.
+                        
+                        ;
+                        ; ALL SYSTEM CALLS ARE TO BDOS ONLY AND NO CALLS TO THE MONITOR ARE PERMITTED
+                        ;
+  0001                  CIN	EQU	1
+  0002                  COUT	EQU	2			;CONSOLE OUTPUT
+  000E                  SELDSK	EQU	14
+  0014                  RDSEQ	EQU	20
+  000F                  FOPEN	EQU	15
+  0010                  FCLOSE	EQU	16
+  0011                  SEARCH1	EQU	17
+  0012                  SEARCH2	EQU	18
+  0013                  ERAFIL	EQU	19
+  0015                  WRSEQ	EQU	21
+  0016                  MAKFIL	EQU	22
+  001A                  SETDMA	EQU	26
+  0000                  HDERR	EQU	0		;HARD DISK ERROR BRANCH
+  0000                  DOSERR	EQU	0		;DLOOK FILENAME ERROR BRACH
+                        ;
+                        ;
+                        ;---FCB	EQUATES
+                        ;
+  0000                  NAM	EQU	0	
+  000B                  FTY	EQU	11			;TYPE
+  0010                  FLA	EQU	16			;FILES LOAD ADDRESS
+  001A                  CRN	EQU	26	 		;NEXT RECORD TO READ/WRITE 
+  0018                  CBN	EQU	24	 		;CURRENT BLOCK NUMBER
+  001C                  RELB	EQU	28			;RANDOM ACCESS RELATIVE BLOCK NUMBER
+  001E                  RELR	EQU	30			;RELATIVE RECORD NUMBER
+  000C                  FSB	EQU	12			;FILE STARTING BLOCK
+  000E                  FSZ	EQU	14			;FILE SIZE IN SECTORS
+                        ;
+                        ; FILE TYPES 0 IS DON'T CARE
+                        ;
+  0001                  COM	EQU	1;
+  0002                  EXE	EQU	2
+  0003                  TXT	EQU	3
+  0004                  BAS	EQU	4
+  0005                  PRO	EQU	5		;PROCEDURE
+                        		;FILE SIZE IN SECTORS
+                        ;
+                        ;-----------------------------
+                        ; MISC. ASSEMBLY CONSTANTS
+                        ;-----------------------------
+                        ;
+  0200                  BLKSIZ	EQU	512			;DISK BLOCK SIZE
+  000B                  NAMSIZ	EQU	11			;DIRECTORY NAME SIZE
+  0003                  EXTSIZ	EQU	3			;EXTENSION SIZE
+  0001                  DDEN	EQU	1			;DRIVE DENSITY
+  0001                  DCOMR	EQU	1			;DOS READ COMMAND
+  0000                  PAD	EQU	0
+  0008                  EXTOFF	EQU	NAMSIZ-EXTSIZ			;SMALL-VM PAD CHAR
+  C304   03             CTLC	BYTE	03H	 		;^C
+  C305   18             CTLX	BYTE    	18H	 		;^X
+  C306   13             CTLS	BYTE	13H			;^S
+  C307   19             CTLY	BYTE	19H			;^Y
+  C308   1A             CTLZ	BYTE	1AH			;^Z
+  C309   20             SPACE	BYTE	20H			;SPACE CHAR
+  C30A   00             	BYTE	0			;ALLOWS IT TO BE USED IN MESSAGES
+  C30B   08             BS	BYTE	08H			;BACK SPACE
+  C30C   0D             CR	BYTE	0DH
+  C30D   0A             LF	BYTE	0AH
+  C30E   07             DEL	BYTE	07H					;DELETE CHAR
+  C30F   FF             EOF	BYTE	0FFH			;END OF FILE 
+  C310   3A             COMT	BYTE	3AH	 		;COMMENT FLAG
+  C311   2E             JUMP	BYTE	'.'	 		;JUMP TO LOADED PROG
+  C312   2E             NULPARM	BYTE	'.'			;NULL PARAMETER FLAG
+  C313   2E             EXT	BYTE	'.'			;EXTENSION 
+  C314   5F             NOTE	BYTE	'_'	 		;OPERATOR NOTE FLAG
+  C315   25             PROM	BYTE 	'%'	 		;PROMPT CHAR
+  C316   24             SUBMARK	BYTE	'$'	 		;MARKS SYMBOLIC PARAM IN PROC FILE
+  C317   2A             SYSFILE	BYTE	'*'	 		;IDENTIFIES A SYSTEM FILE
+  C318   2B             DOSCMD	BYTE	'+'			;DOS COMMAND
+  0000                  CONSOLE	EQU	0			;CONSOLE DEVICE
+  0002                  EXEC	EQU	2			;TYPE OF EXECUTABLE FILE
+  0005                  PROC	EQU	5		 	;TYPE OF PROCEDURE FILE
+  0000                  DEFDRV	EQU	0			;DEFAULT DRIVE FOR PROC
+                        ;
+                        ;	INITIALISATION - SET UP LOCAL AND PROGRAMME WORKSPACE AND VECTORS AND THEN CALL 
+                        ;	MONITOR
+                        ;	PROGRAMMES THAT CHANGE WORKSPACE CANNOT ENTER VIA RETURN BUT MUST COME THROUGH HERE
+                        ;	HAVE COME HERE THROUGH A WARM BOOT/MONITOR AND THAT INTERRUPT VECTORS ARE SET
+                        ;
+  C319   00             	EVEN
+  C31A   02E0 0230      INIT	LWPI	WORKSP		;THIS WORKSPACE IS USED BY ALL LOADED PROGRAMMES
+  C31E   020A EF00      	LI	SP,STACKP		;STACK LOCATION
+                        ;	CLR	R9
+                        ;	FAR_REF
+                        
+                        ;
+                        ; SIMPLE INITIALISE COMMAND LINE SO WE CAN USE COMMON MEMORY FOR THE COMMANDLINE
+                        ;
+  C322   0201 0250      	LI	R1, CMDLINE
+  C326   0202 CD76      	LI	R2, CMDLINE2
+  C32A   DC72           CMDLOOP:	MOVB	*R2+,*R1+
+  C32C   16FE           	JNE	CMDLOOP
+                        ;
+                        ; NOW INITIALISE AS BEFORE
+                        ;
+  C32E   D820 C30C      	MOVB	@CR,@CMDLINE		;NO AUTOBOOT AT PRESENT
+  C332   0250           
+  C334   0200 0250      	LI	R0,CMDLINE
+  C338   C800 00A0      	MOV	R0,@CMDL_PTR		;COMMAND LINE POINTER
+  C33C   04E0 00A2      	CLR	@CMDL_SIZE		;ZERO THE COMMAND LINE SIZE
+                        ;	LI	R0,CMDL_SIZE		;PATCH THE COMMAND LINE SIZE VECTOR
+                        ;	MOV	R0,@CMDL_SIZE_PTR
+  C340   0200 0300      	LI	R0,COMM_BUF		;SYSTEM BUFFER
+  C344   C800 00A4      	MOV	R0,@BUFF_PTR
+  C348   0200 0280      	LI	R0,COMM_FCB
+  C34C   C800 00AC      	MOV	R0,@FCB_PTR
+                        ; PATCH SHELL RETURN VECTOR 
+                        ;
+  C350   0200 0460      INIT22	LI	R0,0460H		;BRANCH INSTRUCTION
+  C354   0201 C60C      	LI	R1,RETURN		;INSERT BRANCH VECTORS
+  C358   C800 0080      	MOV	R0,@SHELL_PTR
+  C35C   C801 0082      	MOV	R1,@SHELL_PTR+2
+                        ;
+                        ; PATCH BDOS VECTORS - NOTE THE WORKSPACE IS NOT USED
+                        ;
+  C360   0200 0460      	LI	R0,0460H		;BRANCH OPCODE
+  C364   0201 D100      	LI	R1,BDOS		;ADDRESS OF BDOS IN MEMORY
+                        
+  C368   C800 0084      	MOV	R0,@BDOS_PTR		;BDOS BRANCH VECTOR INSTRUCTION
+  C36C   C801 0086      	MOV	R1,@BDOS_PTR+2		;BDOS VECTOR
+                        ;
+                        ; 	PATCH FREEM MEMORY VECTORS
+                        ; 	TOP OF FREE MEMORY - RESET BY SHELL WHEN LOADING PROGS FROM DOS
+                        ;
+  C370   0200 0500      	LI	R0,TPA		;START OF FREEMEM WHEN NO PROGRAMMES ARE LOADED
+  C374   C800 00A6      	MOV	R0,@FREEMEM
+                        ;	LI	R0,SHELL - 0200H	;SET THE MEMORY LIMIT ABOVE STACK
+  C378   0200 C300      	LI	R0,SHELL		;SET THE MEMORY LIMIT ABOVE STACK
+  C37C   C800 00B0      	MOV	R0,@MEMLIMIT
+                        ;
+                        ; NOW SIGN ON
+                        ;
+                        ;
+  C380   2FA0 CDDC      	MESG	@SINON		;PRINT SIGN ON MESSAGE
+                        ;
+                        ;	FALL INTO DOCMD
+                        ;
+                        ;---------------------------------------
+                        ;	DO NEXT SHELL COMMAND
+                        ;---------------------------------------
+                        ;
+  C384   C020 CD6A      DOCMD	MOV	@SKIPSW,R0	 	;SKIP THIS CMD?
+  C388   04E0 CD6A      	CLR	@SKIPSW
+  C38C   C000           	MOV	R0,R0
+  C38E   1617           	JNE	DOCMD2A		;YES
+                        ;	MOV	R0,R0
+  C390   0203 0250      	LI	R3,CMDLINE
+  C394   04C1           	CLR	R1
+  C396   D053           	MOVB	*R3,R1
+  C398   9801 C30C      	CB	R1,@CR		;IS 1ST BYTE OF CMD A CR ?
+  C39C   1310           	JEQ	DOCMD2A	 	;YES-IGNORE CMD
+                        
+  C39E   0281 0000      CHKSYS	CI	R1,0		;(MUST USE TWO WORDS) SYS FILE?<<ALTERED AFTER BOOT>>
+  C3A2   1602           	JNE	DOCMD1	 	;NO
+  C3A4   0460 CBF4      	B	@CMDERR	 	;YES
+                        ;
+                        ;	RETURN TO MONITOR ?
+                        ;
+                        
+  C3A8   9801 C305      DOCMD1	CB	R1,@CTLX	 	;^X?
+  C3AC   1602           	JNE	DOCMDAA		 ;NO
+  C3AE   0420 F004      	BLWP	@BANNER		;DON'T INITIAALISE MONITOR
+  C3B2   9801 C307      DOCMDAA	CB	R1,@CTLY		;^Y
+  C3B6   1600           	JNE	DOCMD2
+                        ;
+                        
+                        ;	LEADING CHAR <=SPACE ?
+                        ;
+  C3B8   9801 C309      DOCMD2	CB	R1,@SPACE	 
+  C3BC   1B02           	JH	DOCMD4		;NO
+                        ;
+  C3BE   0460 C634      DOCMD2A	B	@NEXTCMD	 	;YES
+                        ;
+                        ;  TO JUMP TO THE LAST LOADED PROGRAMME AT TPA, JUST TYPE '.'
+                        ;  TO LOAD A PROGRAMME FROM DISC, THEN TYPE '.PROGRAMME NAME'
+                        ;
+  C3C2   9801 C311      DOCMD4	CB	R1,@JUMP		;'.'
+  C3C6   1607           	JNE	DOCMD3	
+  C3C8   0203 0251      	LI	R3,CMDLINE+1
+  C3CC   9813 C309      	CB	*R3,@SPACE		;2ND BYTE A GRAPHIC?
+  C3D0   1B07           	JH	LOOK	 	;YES,LOAD
+  C3D2   0460 C59A      	B	@GOPROG	 	;NO,JUMP
+                        ;
+                        ;******************************************
+                        ;
+                        ;	DOS COMMAND  '+FILENAME'
+                        ;
+                        ;********************************************
+                        ;
+  C3D6   9801 C318      DOCMD3	CB	R1,@DOSCMD
+  C3DA   1602           	JNE	LOOK
+                        ;
+                        ; PROCESS DOS COMMAND HERE
+                        ;
+                        DOCMD9	;MAY USE LATER
+  C3DC   0460 C60C      	B	@RETURN
+                        ;
+                        
+                        ;	LOOKUP NAMED FILE
+                        ;	R3 POINTS TO IT'S POSITION IN THE COMMAND LINE - MUST PRESERVE R3 UNTIL THE
+                        ;	WHOLE LINE HAS BEEN PARSED
+                        ;
+  C3E0   2DA0 C4C6      LOOK:	CALL	@PARSENAME
+  C3E4   2DA0 C700      	CALL	@ICMD		; INTERNAL COMMAND?
+  C3E8   2DA0 C4A0      	CALL	@SEG_SWITCH		; SEARCH FOR ANY SWITCHES?
+                        
+                        	;--- CHECK IF USER PROVIDED AN EXTENSION ---
+  C3EC   9820 0288      	CB	@FCB+EXTOFF,@SPACE	; IS EXTENSION BLANK?
+  C3F0   C309           
+  C3F2   1608           	JNE	L_START		; IF NOT BLANK, SKIP AUTO-SEARCH
+                        
+                        	;--- SETUP AUTO-SEARCH PRIORITY ---
+  C3F4   0200 C4F8      	LI	R0,EXT_TAB		; POINT TO OUR PRIORITY TABLE
+  C3F8   D830 0288      L_TRY:	MOVB	*R0+,@FCB+EXTOFF		;POINT TO "COMBASBAT"
+  C3FC   D830 0289      	MOVB	*R0+,@FCB+EXTOFF + 1		;COPY 'C' / 'B' / 'B'
+  C400   D830 028A      	MOVB	*R0+,@FCB+EXTOFF + 2		;COPY 'M' / 'S' / 'T'
+                        	; (R0 NOW POINTS TO THE NEXT EXTENSION IN THE TABLE)
+                        
+  C404   0203 0280      L_START:	LI	R3,FCB
+  C408   0202 0011      	LI	R2,SEARCH1
+  C40C   2DA0 D100      	CALL	@BDOS
+  C410   C041           	MOV	R1,R1
+  C412   1408           	JHE	L_FOUND		; SUCCESS? (R1 >= 0)
+                        
+                        	;--- IF FAILED, CAN WE TRY ANOTHER EXTENSION? ---
+  C414   9820 0288      	CB	@FCB+EXTOFF,@SPACE	; WERE WE IN A SEARCH? (OPTIONAL CHECK)
+  C418   C309           
+  C41A   0280 C504      	CI	R0,EXT_END		; HAVE WE EXHAUSTED THE TABLE?
+  C41E   1AEC           	JL	L_TRY		; NO? TRY NEXT ONE (.BAS)
+                        
+  C420   0460 CBF4      LOOKERR:	B	@CMDERR	 	; NO FILES FOUND AFTER ALL TRIES
+                        
+  C424   0202 000F      L_FOUND:	LI	R2,FOPEN
+  C428   0203 0280      	LI	R3,FCB
+  C42C   2DA0 D100      	CALL	@BDOS
+  C430   C041           	MOV	R1,R1
+  C432   11F6           	JLT	LOOKERR
+  C434   0204 0280      	LI	R4,FCB
+  C438   C824 000E      	MOV	@FSZ(R4),@MFSZ
+  C43C   CDCE           
+  C43E   D824 000B      	MOVB	@FTY(R4),@MFTY
+  C442   CDCC           
+  C444   0460 C528      	B	@LOAD
+                        
+                        ;DEBUG ROUTINES
+                        ;
+  C448   0201 0280      PRINTFCB:	LI	R1,FCB
+  C44C   0200 0010      	LI	R0,16
+  C450   2EB1           PFCB1	WHEX	*R1+
+  C452   0640           	DECT	R0
+  C454   16FD           	JNE	PFCB1
+  C456   2DC0           	RET
+                        
+  C458   0201 0250      PRINTCMDL:	LI	R1,CMDLINE
+  C45C   0200 0010      	LI	R0,16
+  C460   2EB1           PFCL1	WHEX	*R1+
+  C462   0640           	DECT	R0
+  C464   16FD           	JNE	PFCL1
+  C466   2DC0           	RET
+                        ;---------------------------------------------------------
+                        ; PADSPACE: FILLS FCB AREA WITH SPACE CHARACTERS
+                        ; INPUT:	R2 = NUMBER OF BYTES TO PAD
+                        ;	R4 = DESTINATION POINTER
+                        ;---------------------------------------------------------
+  C468   C082           PADSPACE:	MOV	R2,R2		; IS THE SPACE COUNT ZERO?
+  C46A   1204           	JLE	PADRETS		; YES, NOTHING TO DO
+  C46C   DD20 C309      PADLOOP:	MOVB	@SPACE,*R4+	; STORE SPACE (0X20) AND INC POINTER
+  C470   0602           	DEC	R2		; REDUCE REMAINING COUNT
+  C472   1BFC           	JH	PADLOOP		; LOOP IF R2 IS STILL GREATER THAN 0
+  C474   2DC0           PADRETS:	RET			; RETURN
+                        ;---------------------------------------------------------
+                        ; INPUT:  R3 = Address of the character to check
+                        ; OUTPUT: EQ Status Bit = 1 if VALID, 0 if INVALID
+                        ;---------------------------------------------------------
+  C476   D053           CHKCHAR:	MOVB	*R3,R1		; Load char into high byte
+  C478   0981           	SRL	R1,8		; Move to low byte
+                        
+                        
+                        	; Check if character is below '0' (ASCII 48)
+  C47A   0281 0030      	CI	R1,'0'		; Compare with '0'
+  C47E   1A0C           	JL	INVALID		; If it's < '0', it's a dot or symbol
+                        
+                        	; Check digits '0'-'9'
+  C480   0281 0039      	CI	R1,'9'		; 0-9?
+  C484   1207           	JLE	VALID		; If less or equal, it's valid
+                        	;
+                        	; Check letters (Force uppercase and range check)
+                        	;
+  C486   0241 00DF      	ANDI	R1,00DFH	; Force uppercase (0xDF)
+  C48A   0221 FFBF      	AI	R1,-'A'		; Offset by 'A'
+  C48E   0281 001A      	CI	R1,001AH	; 26 in hex
+  C492   1B02           	JH	INVALID		; If > 25, it's out of range
+                        
+  C494   04C1           VALID:	CLR	R1		; Valid: set R1 to 0
+  C496   1002           	JMP	SETFLAG		; Go set the EQ bit
+                        
+  C498   0201 0001      INVALID:	LI	R1,1		; Invalid: set R1 to 1
+                        
+  C49C   C041           SETFLAG:	MOV	R1,R1		; Set EQ bit (1 if R1=0, 0 if R1=1)
+  C49E   2DC0           	RET			; Return to caller			; Return to caller			; Return to caller
+                        ;
+                        ; SEARCH FOR ANY COMMAND LINE SWITCHES,
+                        ; IE.   FILENAME ><SEGMENT NUMBER> FOR LOAD IN SEGMENT N
+                        ;
+  C4A0   04E0 C6FC      SEG_SWITCH: 	CLR	@SEGNUM		; DEFAULT SEGMENT
+                        ;	WHEX	R3
+  C4A4   9833 C6FF      	CB	*R3+,@SSWITCH		; END
+  C4A8   1304           	JEQ	GETSEG		;KEEP LOOKING FOR NUMBER
+  C4AA   9813 C30C      	CB	*R3,@CR
+  C4AE   16F8           	JNE	SEG_SWITCH		;USE DEFAULT TPA
+  C4B0   1007           	JMP	SSWEXIT
+                        ;
+                        GETSEG:	;CALL	@PRINTCMDL
+  C4B2   C803 C6F6      	MOV	R3,@BUFPNT		;FOR ATOD
+  C4B6   C103           	MOV	R3,R4		;SAVE BUFFER POINTER FOR LATER
+  C4B8   2DA0 C9B6      	CALL	@ATOD		;SEE IF ITS LEGAL
+  C4BC   C801 C6FC      	MOV	R1,@SEGNUM		;SAVE AS SEGMENT NUMBER
+                        	;
+                        	; A BIT OF A HACK.  REPLACE SHELL SWITCH WITH SPACES - NEED TO DO THIS AS THIS
+                        	; SO THAT APPLICATION DOES NOT GET CONFUSED WHEN IT PARSES THE COMMAND LINE
+                        	; LOOKING FOR ITS ARGUMENTS
+                        	;
+                        	;MOVB	@SPACE,R0		;LOAD SPACE 0x20
+                        	;DEC	R4		;BACKUP R3 WHICH NOW POINTS TO THE SSWITCH
+                        SPACEPAD:	;MOVB	R0,*R4+
+                        	;C	R4,@BUFPNT		;THIS IS UPDATED BY CATOH
+                        	;JLE	SPACEPAD
+  C4C0   2DC0           SSWEXIT:	RET
+                        
+  C4C2   0460 C7F0      SSWERR:	B	@PARSERR
+                        ;
+                        	; PARSENAME PARSE THE FILE NAME FROM THE COMMAND LINE
+                        	;
+                        	; ARRIVING HERE WE CAN ASSUME THE CMLDLINE IS POINTING TO A VALID FILE NAME
+                        	; ASSUME THAT R3 HOLDS THE POINTER TO THE APPROPRIATE CMDLINE PLACE
+                        	; VALID ARE ABC.COM, ABCDEFGH.COM ABC. R3 POINTS TO THE NEXT CHAR AFTER THE FILE NAME
+                        	;
+  C4C6   0204 0280      PARSENAME:	LI	R4,FCB	 	;POINT TO FCB AND CMDLINE + 1
+  C4CA   0202 0008      	LI	R2,NAMSIZ - EXTSIZ	;NAME LENGTH
+  C4CE   04C0           	CLR	R0		;DEFAULT TYPE
+                        
+  C4D0   2DA0 C476      PARSE1:	CALL	@CHKCHAR
+  C4D4   1604           	JNE	FILLNAME		;NOT VALID
+                        	;
+                        	; BUILD THE FCB FILENAME
+                        	;
+  C4D6   DD33           	MOVB	*R3+,*R4+		;STORE CHAR IN FCB
+  C4D8   0602           	DEC	R2
+  C4DA   1303           	JEQ	FINDDOT
+  C4DC   10F9           	JMP	PARSE1	 	;KEEP GOING
+                        	;
+                        	; PAD WITH SPACES IF NOT FULL AND ALSO CHECK FOR EXTENSION
+                        	;
+  C4DE   2DA0 C468      FILLNAME:	CALL	@PADSPACE		;FILL NAMSIZ WITH SPACES IF REQUIRED
+                        
+  C4E2   9833 C313      FINDDOT:	CB	*R3+,@EXT		;'.'?
+  C4E6   130F           	JEQ	GETEXT		;YES?  GO GET THE 3 EXTENSION CHARS
+                        	;
+                        	; NO EXTENSION FOUND
+                        	;
+  C4E8   0603           	DEC	R3		;BACKUP SINCE CB INCRMENTED IT
+  C4EA   0202 0003      	LI	R2,EXTSIZ
+  C4EE   0204 0288      	LI	R4,FCB + NAMSIZ - EXTSIZ
+  C4F2   2DA0 C468      	CALL 	@PADSPACE
+                        ;	JMP	GETTYPE
+  C4F6   2DC0           	RET
+                        	;
+                        	; GET FILE EXTENSION
+                        	;
+                        ;--- DATA ---
+                        
+  C4F8   434F 4D42      EXT_TAB:	TEXT	'COMBASBAT'		;9 BYTES TOTAL
+  C4FC   4153 4241      
+  C500   54             
+  C501   54             CHRT:	BYTE	'T'		; FOR .BAT CHECK
+  C502   4D             CHRM:	BYTE	'M'
+  C503   53             CHRS:	BYTE	'S'		; USED FOR "BAS" CHECK
+  C504   00             EXT_END:	BYTE	0
+  C505   00             	EVEN
+                        ;
+  C506   0202 0003      GETEXT:	LI	R2,EXTSIZ		;EXTENSION ARE 3 BYTES LONG
+  C50A   0204 0288      	LI	R4,FCB + NAMSIZ	- EXTSIZ	;POINT TO FCB EXT
+                        
+                        ;
+  C50E   2DA0 C476      NEXTEXT:	CALL	@CHKCHAR		;IS IT A VALID NAME CHAR?
+  C512   1607           	JNE	FILLEXT		;IF SPACE/CRE ETC GO PAD THE REST
+  C514   D073           	MOVB	*R3+,R1		;MOVE CHAR TO FCB
+  C516   0241 DF00      	ANDI	R1,0DF00H		;FORCE UPPERCASE
+  C51A   DD01           	MOVB	R1,*R4+		;STORE UPPER CASE
+  C51C   0602           	DEC	R2
+  C51E   1301           	JEQ	FILLEXT
+  C520   10F6           	JMP	NEXTEXT
+                        
+  C522   2DA0 C468      FILLEXT:	CALL	@PADSPACE		;FILL THE REMAINING CHARS WITH SPACE
+  C526   2DC0           	RET
+                        
+                        ;
+                        ;=================================================================================================
+                        ;
+                        ;	LOAD EXECUTABLE	FILE.  R9 WILL HOLD THE FAR_REF IMPLEMENTED VIA A COMMAND LINE SWITCH
+                        ;	SYNTAX %FILENAME -N   WHERE N IS THE SEGMENT NUMBER, 0 OR 1
+                        ;
+                        ;==================================================================================================
+                        ;
+  C528   04C1           LOAD:	CLR	R1	 	;DISABLE PROG REENTRY
+  C52A   D801 024E      	MOVB	R1,@CMDLINE-2
+                        ;
+                        ; NOW WE NEED TO LOAD TO EITHER SEG 0 OR SEG 1.  IT WILL ON THE COMMAND LINE SWITCHES,I.E. -0 OR -1
+                        ;
+                        ;
+  C52E   0204 0280      	LI	R4,FCB
+  C532   C0E4 0010      	MOV	@FLA(R4),R3		;GET LOAD ADDRESS
+  C536   1602           	JNE	LOAD2
+  C538   0203 0500      	LI	R3,TPA		;LOAD ADDRESS
+  C53C   C803 CD72      LOAD2	MOV	R3,@LADDR
+  C540   04E4 001A      	CLR	@CRN(R4)		;RECORD 0
+  C544   064A           LOAD3	DECT	SP
+  C546   C683           	MOV	R3,*SP		;SAVE DMA ADDR
+                        
+  C548   0202 001A      LOAD0	LI	R2,SETDMA
+  C54C   2DA0 D100      	CALL	@BDOS
+  C550   0202 0014      	LI	R2,RDSEQ 		;LOAD THE FILE
+  C554   0203 0280      	LI	R3,FCB
+  C558   2DA0 D100      	CALL	@BDOS
+  C55C   C0FA           	MOV	*SP+,R3	 	;POP DMA ADDR
+  C55E   0281 FFFF      	CI	R1,-1		;LOOK FOR EOF
+  C562   1303           	JEQ	LOAD1	 		;
+  C564   0223 0200      	AI	R3,BLKSIZ	 	;UP DMA
+  C568   10ED           	JMP	LOAD3	 		;
+  C56A   0223 0200      LOAD1	AI	R3,BLKSIZ	 	;MOVE TO THE NEXT BLOCK TO PROVIDE BUFFER
+  C56E   C803 00A6      	MOV	R3,@FREEMEM		;THIS IS THE NEW FREE MEMORY POINTER
+  C572   9820 0250      	CB	@CMDLINE,@JUMP		;JUST LOAD IT?
+  C576   C311           
+  C578   135D           	JEQ	NEXTCMD	 	;YES
+                        ;
+                        ;**************************************************
+                        ;
+                        ;	DISPATCHER - JUMP TO LOADED PROGRAM IF EXECUTABLE
+                        ;
+                        ;***************************************************
+                        ;
+  C57A   D060 CDCC      	MOVB	@MFTY,R1
+  C57E   0981           	SRL	R1,8
+  C580   0281 0001      	CI	R1,COM		;EXECUTABLE ?
+  C584   130A           	JEQ	GOPROG	 	;YES
+  C586   0281 0002      	CI	R1,EXE		;EXECUTABLE ?
+  C58A   1307           	JEQ	GOPROG	 	;YES
+  C58C   0281 0005      	CI	R1,PROC		;PROCEDURE ?
+  C590   1351           	JEQ	NEXTCMD	 	;YES
+  C592   0281 0003      	CI	R1,TXT		;TXT ?
+  C596   134E           	JEQ	NEXTCMD		;YES
+  C598   104D           	JMP	NEXTCMD
+                        ;
+                        ;  RUN EXECUTABLE
+                        ;
+                        
+  C59A   C820 CD72      GOPROG	MOV	@LADDR,@GO+2		;JUMP ADDR
+  C59E   C5CC           
+  C5A0   0204 0250      	LI	R4,CMDLINE 		;?
+  C5A4   0584           GOLOOP	INC	R4	
+  C5A6   9814 C309      	CB	*R4,@SPACE	 	;1ST CHAR <=SPACE?
+  C5AA   1BFC           	JH	GOLOOP	 	;NO
+  C5AC   04C1           	CLR	R1	 	;TELL SMALL-VM IT'S A SHELL COMMAND
+  C5AE   D801 024F      	MOVB	R1,@CMDLINE-1	;DONE
+  C5B2   0200 0080      	LI	R0,SHELL_PTR		;RETURN ADDRESS IF NEEDED
+  C5B6   064A           	DECT	SP
+  C5B8   C680           	MOV	R0,*SP
+                        ;
+                        ;  WHICH SEGMENT ARE WE TO LOAD APPLICATION INTO?
+                        ;
+  C5BA   C260 C6FC      	MOV	@SEGNUM,R9
+                        ;	WHEX	R9
+  C5BE   C249           	MOV	R9,R9
+  C5C0   1304           	JEQ	GO
+                        
+                        ;
+                        ; PROGRAM IS TO BE LOADED AND RUN FROM SEGMENT 1
+                        ;
+  C5C2   2DA0 C5CE      	CALL	@INIT_LOADER
+  C5C6   0460 0400      	B	@LOADER
+                        ;
+  C5CA   0460 CC0A      GO	B	@SHELLERR 		;<<THIS ADDR IS ALTERED BY MOVE @GO+2>>
+                        ;
+                        ; COPY THE RELOCATABLE LOADER CODE TO LOADER AREA IN COMMON MEMORY (IE 0400H)
+                        ;
+  C5CE   0202 0400      INIT_LOADER:	LI	R2,LOADER		;GET LOADER LOCATION ADDRESS
+  C5D2   0201 C5E0      	LI	R1,LOADERCODE
+  C5D6   CCB1           IL0:	MOV	*R1+,*R2+
+  C5D8   0281 C60C      	CI	R1,END_LOADER
+  C5DC   12FC           	JLE	IL0
+  C5DE   2DC0           	RET
+                        
+                        ;
+                        ;  SEGMENT LOADER;  USED IF PROGRAMME IS TO BE LOADED INTO ANOTHER SEGMENT
+                        ;
+                        ;  VALUES FOR R9:  0001H MEANS WE ARE EXECUTING IN SEGMENT 0 AND WANT TO MOVE DATA TO SEGMENT 1
+                        ;
+  C5E0   C260 C6FC      LOADERCODE:	MOV	@SEGNUM, R9
+                        ;	WHEX	R9
+                        ;	LI	R9,0001H		;THIS MEANS WE WANT TO MOVE DATA TO SEGMENT 1
+  C5E4   2C00           	FAR_REF			;MAKE IT SO - ALL LDS, AND LDD INSTRUCTIONS WILL NOW ACCESS SEG 1
+                        
+  C5E6   C060 CD72      	MOV	@LADDR,R1 		;SEG1_START
+  C5EA   C0A0 00A6      	MOV	@FREEMEM,R2		;END OF MODULE
+  C5EE   C0E0 CD72      	MOV	@LADDR,R3 		;SEG1_DEST
+  C5F2   07C0           SLA:	LDD
+  C5F4   CCD1           	MOV	*R1,*R3+
+  C5F6   04F1           	CLR	*R1+
+  C5F8   8081           	C	R1,R2
+  C5FA   12FB           	JLE	SLA
+                        ;
+                        ;SET CALL DIRECTION, CALL SEGMENT 1, RETURN TO SEGMENT 0
+                        ;
+  C5FC   C260 C6FC      	MOV	@SEGNUM,R9
+  C600   0A89           	SLA	R9,8		; SHIFT SO THAT WE HAVE 0100H ETC
+  C602   C0E0 CD72      	MOV	@LADDR,R3
+  C606   2CD3           	CALL_FAR	*R3		;RETURNING PROGRAMME WI
+  C608   0460 C60C      	B	@RETURN
+                        
+  C60C                  END_LOADER:	EQU	$ + 0
+                        ;
+                        ; R4 = RETURN CODE		
+                        ;			
+                        ;
+                        ;	R1 IS THE RETURN CODE
+                        ;	NOTE NEED TO RESTORE WP POINTERS ETC
+                        ;
+  C60C   D801 024E      RETURN:	MOVB	R1,@CMDLINE-2
+  C610   02E0 0230      	LWPI	WORKSP		;REINITIALSE WORKSPACE AND STACK POINTERS
+  C614   020A EF00      	LI	SP,STACKP
+  C618   04CF           	CLR	R15		;CLEAR STATUS
+  C61A   D060 024E      	MOVB	@CMDLINE-2,R1
+  C61E   0881           	SRA	R1,8
+  C620   0281 FFFF      	CI	R1,-1		;RETURN VIA SMALL-VM?
+  C624   1607           	JNE	NEXTCMD 		;NO
+  C626   04C1           	CLR	R1
+  C628   D801 024E      	MOVB	R1,@CMDLINE-2	;ENABLE PROGRAMME RE-ENTRY
+  C62C   C041           	MOV	R1,R1	 	;IS RETURN CODE ZERO?
+  C62E   1302           	JEQ	NEXTCMD		;YES
+  C630   0460 CC2C      	B	@UNPROC	 	;NO,ABORT PROC CMD IF IN PROGRESS
+                        ;
+                        ;-----WHERE IS NEXT COMMAND TO BE FOUND
+                        ;
+  C634   D060 CD68      NEXTCMD	MOVB	@PROCSW,R1
+  C638   1302           	JEQ	PROMPT
+  C63A   0460 CA72      	B	@PFETCH 
+                        				 
+                        ;
+                        ;-----CONSOLE	INPUT
+                        ;
+  C63E   D0E0 C315      PROMPT: 	MOVB	@PROM,R3		;PROMPT CHARACTER INTO MSB
+  C642   2DA0 CD26      	CALL	@OUTCHAR
+  C646   0204 0250      	LI	R4,CMDLINE 		;R4=DEST PTR
+  C64A   0205 0040      	LI	R5,CLSZ		;R5=CHAR COUNTER
+  C64E   C060 0000      CINLOOP	MOV	@CONSOLE,R1	
+  C652   2DA0 CD1A      	CALL	@INCHAR	 	; RETURN INTO MSB OF R1
+  C656   9801 C30B      	CB	R1,@BS	 	;BS?
+  C65A   132A           	JEQ	RUBOUT	
+  C65C   9801 C30E      	CB	R1,@DEL	 	;DEL?
+  C660   1327           	JEQ	RUBOUT	
+  C662   9801 C304      	CB	R1,@CTLC 		;^C?
+  C666   1604           	JNE	STOWIT	 	;NO
+  C668   D060 C30C      	MOVB	@CR,R1	 	;YES (CR=0DH)
+  C66C   D801 0250      	MOVB	R1,@CMDLINE	 	;IGNORE CMD
+                        ;
+                        ;---Convert to upper case
+                        ;
+  C670   C001           STOWIT	MOV 	R1,R0
+  C672   0980           	SRL	R0,8
+  C674   0280 0061      	CI 	R0,61H		;'a'
+  C678   1A08           	JL	STOWIT2	
+  C67A   0280 007A      	CI	R0,7AH		;'z'
+  C67E   1B05           	JH	STOWIT2
+  C680   0220 FFE0      	AI	R0,-20H		;CONVERT TO LOWER CASE
+  C684   06C0           	SWPB	R0
+  C686   DD00           	MOVB	R0,*R4+
+  C688   1001           	JMP	STOWIT2+2
+  C68A   DD01           STOWIT2	MOVB	R1,*R4+		;STORE THE CHARACTER
+  C68C   0605           	DEC	R5	
+  C68E   1224           	JLE	CIOERR		;NO MORE SPACE
+  C690   9801 C309      	CB	R1,@SPACE		;CTL CHAR?
+  C694   1404           	JHE	ECHO	 	;NO,CONTINUE
+  C696   04C0           	CLR	R0
+  C698   D060 C30C      	MOVB	@CR,R1		;FORCE CR
+  C69C   D500           	MOVB	R0,*R4 		;NULL TERMINATE
+  C69E   C0C1           ECHO	MOV	R1,R3		;ECHO CHAR
+  C6A0   2DA0 CD26      	CALL	@OUTCHAR		;RETURNS CHAR IN R1 LSB
+  C6A4   04E0 CD6A      	CLR	@SKIPSW	 	;DOSN'T ALTER FLAGS
+  C6A8   9801 C30D      	CB	R1,@LF	 	;OUTCHAR GENERATES AUTO LF AFTER CR
+  C6AC   130E           	JEQ	GODOCMD	 
+  C6AE   10CF           	JMP	CINLOOP	
+  C6B0   0285 0040      RUBOUT	CI	R5,CLSZ	
+  C6B4   14CC           	JHE	CINLOOP	 	;CMDLINE IS EMPTY
+  C6B6   0585           	INC	R5	
+  C6B8   0604           	DEC	R4	
+  C6BA   064A           	DECT	SP
+  C6BC   C684           	MOV	R4,*SP		;PUSH R4
+  C6BE   0204 CE35      	LI	R4,RUBMSG	
+  C6C2   2DA0 CD50      	CALL	@OUTSTR	 
+  C6C6   C13A           	MOV	*SP+,R4		;POP R4
+  C6C8   10C2           	JMP	CINLOOP	
+  C6CA   0200 0250      GODOCMD	LI	R0,CMDLINE
+  C6CE   6100           	S	R0,R4		;CALCULATE THE LENGTH OF THE COMMAND LINE USING THE POINTER IN R4
+                        ;	SWPB	R4		;CAN'T BE GREATER THAN 255
+  C6D0   C804 00A2      	MOV	R4,@CMDL_SIZE	;STORE CMDLINE SIZE FOR SMALL C
+  C6D4   0460 C384      	B	@DOCMD	
+  C6D8   0460 CBFA      CIOERR	B	@LINERR	
+                        
+                        ;
+                        ;*****************************************************
+                        ;	LOOK FOR INTERNAL COMMANDS, I.E. DIR, SAVE, ETC
+                        ;	FBC -> FILENAME
+                        ;
+                        ;*****************************************************
+                        ;
+  0004                  CMDCNT	EQU 	4		;NUMBER OF POSSIBLE INTERNAL COMMANDS
+  C6DC   4449 52        ICLIST	TEXT	"DIR"
+  C6DF   00             	BYTE	0		;END
+  C6E0   C752           	WORD	DSKDIR		;ADDRESS
+  C6E2   5341 5645      	TEXT	"SAVE"
+  C6E6   00             	BYTE	0		; END
+  C6E7   C7F4           	WORD	DSKSAVE		;ADDRESS
+  C6E9   4552 41        	TEXT	"ERA"		;ERASE
+  C6EC   00             	BYTE	0		; END
+  C6ED   C8E8           	WORD	ERAFILE		;ADDRESS
+  C6EF   5459 5045      	TEXT	"TYPE"		;TYPE A FILE TO THE CONSOLE
+  C6F3   00             	BYTE	0		; END
+  C6F4   C97E           	WORD	TYPEFILE		;ADDRESS
+  C6F6                  	EVEN
+                        ;
+                        ;	MISC STORAGE
+                        ;
+  C6F6   0000           BUFPNT	WORD	0	 	;BUFFER POINTER
+  C6F8   0000           RECCNT	WORD	0	 	;NO. OF PAGES TO SAVE
+  C6FA   0000           SADDR	WORD	0		;START ADDRESS
+  C6FC   0000           SEGNUM	WORD	0		;SEGMENT NUMBER
+                        
+  C6FE   2D             SWITCH	BYTE	'-'		;COMMAND LINE SWITCH
+  C6FF   2F             SSWITCH	BYTE	'/'		;SEGMENT SWITCH
+  C700                  	EVEN
+                        ;
+  C700   0201 C6DC      ICMD	LI	R1,ICLIST
+  C704   0204 0280      	LI	R4,FCB		;NAME OF COMMAND
+  C708   0205 0004      	LI	R5,CMDCNT		;NUMBER OF INTERNAL COMMANDS
+  C70C   9C74           ICMD0	CB	*R4+,*R1+
+  C70E   13FE           	JEQ	ICMD0
+  C710   0601           	DEC	R1		;BACK UP THE POINTER
+  C712   0604           	DEC	R4
+  C714   9814 C309      	CB	*R4,@SPACE		;IF SPACE WE HAVE REACHED THE END OF THE FILENAME
+  C718   1B09           	JH	ICMD1	 	;GRAPHIC CHARACTER, MEANS NO MATCH
+  C71A   D011           	MOVB	*R1,R0		;TEST FOR END OF ENTRY
+  C71C   1607           	JNE	ICMD1		;NO MATCH
+                        ;
+                        ;	MATCH HERE BRANCH TO ADDRESS
+                        ;	
+  C71E   0581           	INC	R1		;MOVE TO ADDRESS FIELD
+  C720   D0B1           	MOVB	*R1+,R2		;MSB PART OF ADDRESS
+  C722   06C2           	SWPB	R2
+  C724   D0B1           	MOVB	*R1+,R2
+  C726   06C2           	SWPB	R2		;ADDRESS IS NOW IN R2
+  C728   C03A           	MOV	*SP+,R0		;WE WON'T BE RETURNING SO POP RETURN ADDRESS
+  C72A   0452           	B	*R2		;CALL THE COMMAND
+                        ;
+  C72C   0605           ICMD1	DEC	R5		;MORE COMMANDS TO SEARCH ?
+  C72E   1306           	JEQ	ICMDE
+                        ;
+                        ; NEXT INTERNAL COMMAND
+                        ;
+  C730   D031           ICMD2	MOVB	*R1+,R0		; LOOK FOR TEMINATOR
+  C732   16FE           	JNE	ICMD2
+  C734   05C1           	INCT	R1		;POINT TO NEXT COMMAND
+  C736   0204 0280      	LI	R4,FCB		;R1 POINTS TO NEXT COMMAND
+  C73A   10E8           	JMP	ICMD0
+  C73C   2DC0           ICMDE	RET			;RETURN 
+                        ;
+                        ;*********************************************************
+                        ;
+                        ; INTERNAL COMMAND DIR
+                        ;
+                        ;**********************************************************
+                        ;
+                        ;	MISC DEFINITIONS
+                        ;
+  C73E   203A 20        BAR	TEXT	' : '
+  C741   00             	BYTE	0
+  C742   0D0A 00        CRLF	BYTE	0DH,0AH,0
+  C745   4E4F 2046      MNOFILE	TEXT	'NO FILES'
+  C749   494C 4553      
+  C74D   0D0A 00        	BYTE	0DH,0AH,0
+  C750                  	EVEN
+  C750   0000           CCOUNT	WORD	0			;COLUMN COUNTER
+                        ;
+  C752                  	EVEN
+                        ;
+                        ; PERFORM A DIRECTORY LIST OF ALL FILES ON DRIVE
+                        ;
+  C752   0200 0001      DSKDIR:	LI	R0,1
+  C756   C800 C750      	MOV	R0,@CCOUNT
+  C75A   0201 3F00      	LI	R1,'?'*256		;WILD CHARACTER
+  C75E   0200 000B      	LI	R0,NAMSIZ 		;FCB COUNTER
+  C762   0208 0280      	LI	R8,FCB	  		;
+  C766   C088           	MOV	R8,R2	 		;SAVE FCB
+  C768   DC81           DSKDIR0	MOVB	R1,*R2+	 		;STORE IN FCB
+  C76A   0600           	DEC	R0	 		;ANY MORE ALLOWED ?
+  C76C   16FD           	JNE	DSKDIR0	 		;YES
+                        ;
+                        ;	NOW SEARCH FOR FILES
+                        ;
+  C76E   0202 0011      	LI	R2,SEARCH1		;SEARCH RETURNS WITH R3->DIRECTORY ENTRY
+  C772   0203 0280      	LI	R3,FCB
+  C776   2DA0 D100      	CALL	@BDOS	 		;TRY TO FIND A FILE
+  C77A   C041           	MOV	R1,R1	 		;SUCCESS ?
+  C77C   1134           	JLT	NOFILE			;NO FILES ON DISC
+  C77E   2DA0 C798      	CALL	@PNAME			;PRINT THE NAMES
+                        ;
+                        ;	CONTINUE
+                        ;
+  C782   0202 0012      DSKDIR1	LI	R2,SEARCH2
+  C786   0203 0280      	LI	R3,FCB
+  C78A   2DA0 D100      	CALL	@BDOS
+  C78E   C041           	MOV	R1,R1
+  C790   1125           	JLT	DIREXIT
+  C792   2DA0 C798      	CALL	@PNAME
+  C796   10F5           	JMP	DSKDIR1
+                        ;
+                        ;********************************
+                        ;
+                        ;	PRINT THE DIRECTORY ENTRY
+                        ;
+                        ;	R3 -> CURRENT DIRECTORY ENTRY	
+                        ;
+                        ;*********************************
+                        ;
+  C798   0620 C750      PNAME	DEC	@CCOUNT
+  C79C   1606           	JNE	PNAME1
+  C79E   2FA0 C742      	MESG	@CRLF
+  C7A2   0201 0001      	LI	R1,1
+  C7A6   C801 C750      	MOV	R1,@CCOUNT
+                        ;
+  C7AA   C043           PNAME1	MOV	R3,R1			;DIRECTORY POINTER
+  C7AC   0200 000B      	LI	R0,NAMSIZ
+  C7B0   064A           PNAME2	DECT	SP
+  C7B2   C680           	MOV	R0,*SP			;PUSH R0
+  C7B4   D0F1           	MOVB	*R1+,R3			;PRINT NAME
+  C7B6   06C3           	SWPB	R3			;DO PRINTS LSB
+  C7B8   064A           	DECT	SP
+  C7BA   C681           	MOV	R1,*SP			;PUSH R1
+  C7BC   0202 0002      	LI	R2,COUT
+  C7C0   2DA0 D100      	CALL	@BDOS	
+  C7C4   C07A           	MOV	*SP+,R1
+  C7C6   C03A           	MOV	*SP+,R0
+  C7C8   0600           	DEC	R0
+  C7CA   16F2           	JNE	PNAME2
+  C7CC   C020 C750      	MOV	@CCOUNT,R0
+  C7D0   0280 0001      	CI	R0,1			;IF LAST ENTRY ON LINE DONT BAR
+  C7D4   1302           	JEQ	PNAME3
+  C7D6   2FA0 C742      	MESG	@CRLF
+  C7DA   2DC0           PNAME3	RET
+                        ;
+                        ;
+  C7DC   2FA0 C742      DIREXIT	MESG	@CRLF
+  C7E0   04C1           	CLR 	R1			;SHOW RETURN NOT FROM VM
+  C7E2   0460 C60C      	B	@RETURN			;RETURN TO SHELL
+                        ;
+  C7E6   2FA0 C745      NOFILE	MESG	@MNOFILE
+  C7EA   04C1           	CLR	R1			;SHOW RETURN NOT FROM VM
+  C7EC   0460 CBF4      	B	@CMDERR	
+                        
+                        ;
+                        ;*******************************************************
+                        ;
+                        ; SAVE A PROGRAMME IN MEMORY TO A FILE 
+                        ; SYNTAX.  OPTIONAL ARGUMENT ARE IN []
+                        ;	SAVE <NUMBER OF 512 SECTORS> <FILENAME>  <-MEMORY ADDRESS>
+                        ;
+                        ;
+                        ;
+                        ;******************************************************
+                        ;
+                        ;BDOSRV EQUATES	
+                        ;
+  00A0                  CMDPTR	EQU	0A0H		;SHELL COMMAND LINE POINTER
+  C7F0   0460 C998      PARSERR	B	@PARSMSG
+                        
+                        
+  C7F4   04E0 C6F6      DSKSAVE:	CLR	@BUFPNT
+  C7F8   04E0 C6F8      	CLR	@RECCNT
+  C7FC   0203 0500      	LI	R3,TPA		;DEFAULT START ADDRESS
+  C800   C803 C6FA      	MOV	R3,@SADDR
+  C804   0203 0250      	LI	R3,CMDLINE
+  C808   9833 C309      START00	CB	*R3+,@SPACE	 	;JUMP OVER 'SAVE' LOOK FOR NON VALID CHARACTERS
+  C80C   1BFD           	JH	START00
+  C80E   0603           	DEC	R3	 	;BACK UP TO 1ST CHAR
+  C810   9813 C30C      START02	CB	*R3,@CR		;EOF COMMAND?
+  C814   13ED           	JEQ	PARSERR
+  C816   9833 C309      	CB	*R3+,@SPACE		;NOW JUMP OVER SPACES
+  C81A   12FA           	JLE	START02
+  C81C   0603           	DEC	R3
+  C81E   C803 C6F6      	MOV	R3,@BUFPNT		;LOOK FOR NUMBER OF SECTORS
+  C822   2DA0 C9B6      	CALL	@ATOD	 	;CONVERT ASCII TO DEC
+  C826   C041           	MOV	R1,R1	 	;ZERO SHOWS ERROR
+  C828   13E3           	JEQ	PARSERR
+  C82A   C801 C6F8      	MOV	R1,@RECCNT		;SAVE AS PAGE COUNT
+  C82E   C0E0 C6F6      	MOV	@BUFPNT,R3
+                        ;
+                        ;	LOOK FOR FILE NAME - R8 POINTS FOR CMDLINE
+                        
+  C832   9813 C30C      PREPARSE	CB	*R3,@CR		;EOL COMMAND?
+  C836   13DC           	JEQ	PARSERR
+  C838   9833 C309      	CB	*R3+,@SPACE 		;LOOK FOR NAME
+  C83C   12FA           	JLE	PREPARSE
+  C83E   0603           	DEC	R3		;BACK UP
+  C840   2DA0 C4C6      	CALL	@PARSENAME		;COPY THE NAME TO THE FCB
+                        
+                        ;	LOOK FOR START ADDRESS	
+                        ;	IF EOL ENCOUNTERED USE DEFAULT TPA
+                        ;
+  C844   9833 C309      NAM2	CB	*R3+,@SPACE		;EAT ALL SPACES TO
+  C848   13FD           	JEQ	NAM2		;KEEP LOOKING FOR CR OR SWITCH
+  C84A   0603           	DEC	R3		;BACK UP
+  C84C   9813 C30C      	CB	*R3,@CR
+  C850   130B           	JEQ	NAMSRCH		;USE DEFAULT TPA IF MEMORY LOCATION NO SPECIFIED
+  C852   9833 C6FE      	CB	*R3+,@SWITCH		;SEE IF ANY SWITCHS ARE THERE
+  C856   16CC           	JNE	PARSERR
+  C858   C803 C6F6      	MOV	R3,@BUFPNT		;FOR ATOD
+  C85C   2DA0 C9E2      	CALL	@CATOH		;SEE IF ITS LEGAL
+  C860   C041           	MOV	R1,R1		;ZERO IS AN ERROR
+  C862   13C6           	JEQ	PARSERR
+  C864   C801 C6FA      	MOV	R1,@SADDR		;SAVE AS START ADDRESS
+                        ;
+                        ;	USE BDOS TO SEARCH FOR THE FILE IN DOS
+                        ;
+  C868   0202 0011      NAMSRCH	LI	R2,SEARCH1		;SEARCH RETURNS WITH R3->DIRECTORY ENTRY
+  C86C   0203 0280      	LI	R3,FCB
+  C870   2DA0 D100      	CALL	@BDOS	 	;TRY TO FIND A FILE
+  C874   C041           	MOV	R1,R1	 	;SUCCESS ?
+  C876   1106           	JLT	NAM5		;NO FILES ON DISC
+  C878   0202 0013      NAM3	LI	R2,ERAFIL 		;PURGE IF ALREADY EXITS
+  C87C   0203 0280      	LI	R3,FCB
+  C880   2DA0 D100      	CALL	@BDOS
+                        
+  C884   0202 0016      NAM5	LI	R2,MAKFIL
+  C888   0203 0280      	LI	R3,FCB
+  C88C   2DA0 D100      	CALL	@BDOS	 	;TRY TO MAKE THE FILE
+  C890   C041           	MOV	R1,R1	 	;SUCCESS ?
+  C892   117A           	JLT	MKERR	 	;MAKE ERROR
+                        	;
+                        	;FILE TYPE HAS BEEN SET IN PARSENAME ROUTINE
+                        	;
+                        	;CLR	R0
+  C894   0204 0280      	LI	R4,FCB
+                        	;MOVB	R0,@FTY(R4)		;ZERO SAYS DONT CARE
+  C898   C0E0 C6FA      	MOV	@SADDR,R3		;START ADDRESS
+  C89C   C903 0010      	MOV	R3,@FLA(R4)		;EXECUTE ADDRESS
+  C8A0   04E4 001A      	CLR	@CRN(R4)		; RECORD 0 IS FOR MODULE TABLE INDEX
+                        
+                        
+  C8A4   064A           WRDATA	DECT	SP
+  C8A6   C683           	MOV	R3,*SP		;PUSH R3
+  C8A8   0202 001A      	LI	R2,SETDMA
+  C8AC   2DA0 D100      	CALL	@BDOS
+  C8B0   0202 0015      	LI	R2,WRSEQ
+  C8B4   0203 0280      	LI	R3,FCB
+  C8B8   2DA0 D100      	CALL	@BDOS
+  C8BC   C0FA           	MOV	*SP+,R3	 	;POP ADDR
+  C8BE   C041           	MOV	R1,R1	 	;WRITE ERROR ?
+  C8C0   1160           	JLT	WRITERR	 	;YES
+                        ;
+                        ;	SET FILE LIMIT
+                        ;
+  C8C2   8803 00B0      	C	R3,@MEMLIMIT
+  C8C6   146C           	JHE	LARGERR
+  C8C8   0223 0200      	AI	R3,BYTSEC 		;NEXT PAGE
+  C8CC   0620 C6F8      	DEC	@RECCNT	 	;FINISHED ?
+  C8D0   16E9           	JNE	WRDATA		;YES
+  C8D2   0202 0010      WRDATAC	LI	R2,FCLOSE	 	;NOW CLOSE THE FILE
+  C8D6   0203 0280      	LI	R3,FCB
+  C8DA   2DA0 D100      	CALL	@BDOS
+  C8DE   04C1           EXIT	CLR	R1		;RETURN CODE FOR SHELL
+  C8E0   0460 C60C      	B	@RETURN		;NEED TO CALL SHELL INIT BECAUSE WE HAVE ALTERED WP
+                        
+                        
+                        ;
+                        ;*******************************************************
+                        ;
+                        ; ERASE A FILE FROM DISC 
+                        ;
+                        ;
+                        ;******************************************************
+  C8E4   0460 C998      ERAPERR	B	@PARSMSG
+                        
+  C8E8   04E0 C6F8      ERAFILE	CLR	@RECCNT
+  C8EC   04E0 C6F6      	CLR	@BUFPNT
+  C8F0   0203 0500      	LI	R3,TPA			;DEFAULT START ADDRESS
+  C8F4   C803 C6FA      	MOV	R3,@SADDR
+  C8F8   0203 0250      	LI	R3,CMDLINE
+  C8FC   9833 C309      ERA0	CB	*R3+,@SPACE	 	;JUMP OVER 'ERA' LOOK FOR NON VALID CHARACTERS
+  C900   1BFD           	JH	ERA0
+  C902   0603           	DEC	R3	 		;BACK UP TO 1ST CHAR
+                        ;
+                        ;LOOK FOR FILE NAME
+                        ;
+                        
+  C904   9813 C30C      ERA01	CB	*R3,@CR			;EOL COMMAND?
+  C908   13ED           	JEQ	ERAPERR
+  C90A   9833 C309      	CB	*R3+,@SPACE 		;LOOK FOR NAME
+  C90E   12FA           	JLE	ERA01
+  C910   0603           	DEC	R3
+                        
+  C912   2DA0 C4C6      	CALL	@PARSENAME
+  C916   2DA0 C448      	CALL	@PRINTFCB
+  C91A   101E           	JMP	ERA4
+                        
+M C91C   9813 C30C      ERA01	CB	*R3,@CR			;EOL COMMAND?
+  C920   13E1           	JEQ	ERAPERR
+  C922   9833 C309      	CB	*R3+,@SPACE 		;LOOK FOR NAME
+  C926   12EE           	JLE	ERA01
+  C928   0603           	DEC	R3	 		;BACK UP
+                        	;MOV	R8,R3			;R3->NAME
+  C92A   0200 000B      	LI	R0,NAMSIZ 		;FCB COUNTER
+  C92E   0204 0280      	LI	R4,FCB	  	;
+  C932   D620 C309      	MOVB	@SPACE,*R8		;FILL WITH SPACE
+  C936   C088           	MOV	R8,R2	 	;SAVE FCB
+  C938   9813 C309      ERA1	CB	*R3,@SPACE	 	;END OF NAME ?
+  C93C   1207           	JLE	ERA2	 	;YES
+  C93E   13D2           	JEQ	ERAPERR
+  C940   0583           	INC	R3		;UP POINTER
+  C942   0600           	DEC	R0		;DONT STORE TOO MANY
+  C944   12F9           	JLE	ERA1
+  C946   0603           	DEC	R3
+  C948   DCB3           	MOVB	*R3+,*R2+		;STORE IN FCB
+  C94A   10F6           	JMP	ERA1		;KEEP GOING
+  C94C   C000           ERA2	MOV	R0,R0
+  C94E   1204           	JLE	ERA4		;FCB ALREADY FULL
+  C950   DCA0 C309      ERA3	MOVB	@SPACE,*R2+	 	;PAD WITH SPACES
+  C954   0600           	DEC	R0
+  C956   16FC           	JNE	ERA3
+                        ;
+                        ;	USE BDOS TO SEARCH FOR FILE
+                        ;
+  C958   0202 0011      ERA4	LI	R2,SEARCH1		;SEARCH RETURNS WITH R3->DIRECTORY ENTRY
+  C95C   0203 0280      	LI	R3,FCB
+  C960   2DA0 D100      	CALL	@BDOS	 	;TRY TO FIND A FILE
+  C964   C041           	MOV	R1,R1	 	;SUCCESS ?
+  C966   1108           	JLT	ERAE		;NO FILES ON DISC
+  C968   0202 0013      	LI	R2,ERAFIL 		;PURGE IF ALREADY EXITS
+  C96C   0203 0280      	LI	R3,FCB
+  C970   2DA0 D100      	CALL	@BDOS
+  C974   C041           	MOV	R1,R1	 	;WRITE ERROR ?
+  C976   1117           	JLT	MKERR2	 	;YES
+  C978   04C1           ERAE	CLR	R1		;RETURN CODE FOR SHELL
+  C97A   0460 C60C      	B	@RETURN		;NEED TO CALL SHELL INIT BECAUSE WE HAVE ALTERED WP
+                        ;
+                        ;*****************************************************************
+                        ;
+                        ;	OUTPUT A TEXT FILE TO THE CONSOLE
+                        ;	THIS LOADS THE FILE USING .FILENAME AND THEN SENDS IT TO THE CONSOLE
+                        ;
+                        ;*****************************************************************
+                        ;
+  C97E   0460 C60C      TYPEFILE:	B	@RETURN
+                        ;
+                        ;  ERROR MESSAGES
+                        ;
+  C982   2FA0 CA49      WRITERR	MESG	@ERRMSG4
+  C986   100F           	JMP	MKERR2
+  C988   0460 F000      MKERR	B	@MONITOR
+  C98C   2FA0 CA3A      	MESG	@ERRMSG3
+  C990   100A           	JMP	MKERR2
+  C992   2FA0 CA1A      CLOSERR	MESG	@ERRMSG1		;IF WE DONT CLOSE UNUSED BLOCKS MAY
+  C996   1007           	JMP	MKERR2		;BE STILL ALLOCATED
+  C998   2FA0 CA2A      PARSMSG	MESG	@ERRMSG2
+  C99C   0460 C634      	B	@NEXTCMD
+  C9A0   2FA0 CA59      LARGERR	MESG	@ERRMSG5
+  C9A4   1000           	JMP	MKERR2
+                        	
+  C9A6   0202 0010      MKERR2	LI	R2,FCLOSE		;TRY TO CLOSE THE FILE
+  C9AA   0203 0280      	LI	R3,FCB
+  C9AE   2DA0 D100      	CALL	@BDOS
+  C9B2   0460 C60C      	B	@RETURN;
+                        ;
+                        ;
+                        ; CONVERT ASCII TO DECIMAL
+                        ;
+  C9B6   04C3           ATOD	CLR	R3	 	;PRESET VALUE
+  C9B8   0208 000A      	LI	R8,10	 	;BASE
+  C9BC   C020 C6F6      ATOD00	MOV	@BUFPNT,R0	 	;
+  C9C0   D090           	MOVB	*R0,R2	 	;GET CHAR
+  C9C2   0982           	SRL	R2,8	 	;
+  C9C4   0222 FFD0      	AI	R2,-'0' 		;REMOVE ASCII BIAS
+  C9C8   1103           	JLT	ATOD03	 	;NOT VALID
+  C9CA   0282 000A      	CI	R2,10	 	;
+  C9CE   1102           	JLT	ATOD04	 	;OKAY
+  C9D0   C043           ATOD03	MOV	R3,R1	 	;ANSWER
+  C9D2   2DC0           	RET
+                        
+  C9D4   C002           ATOD04	MOV	R2,R0
+  C9D6   C083           	MOV	R3,R2
+  C9D8   3888           	MPY	R8,R2
+  C9DA   A0C0           	A	R0,R3
+  C9DC   05A0 C6F6      	INC	@BUFPNT 
+  C9E0   10ED           	JMP	ATOD00
+                        ;
+                        ;	CONVERT ALPHA TO HEX
+                        ;
+  C9E2   04C2           CATOH	CLR	R2
+  C9E4   C020 C6F6      LOOP	MOV	@BUFPNT,R0
+  C9E8   04C1           	CLR	R1
+  C9EA   D050           	MOVB	*R0,R1
+  C9EC   0281 3000      	CI	R1,'0'*256
+  C9F0   1A12           	JL	NOTHEX
+  C9F2   0281 3900      	CI	R1,'9'*256
+  C9F6   1208           	JLE	GOTONE
+  C9F8   0281 4100      	CI	R1,'A'*256
+  C9FC   1A0C           	JL	NOTHEX
+  C9FE   0281 4600      	CI	R1,'F'*256
+  CA02   1B09           	JH	NOTHEX
+  CA04   0221 0900      	AI	R1,0900H
+  CA08   0A41           GOTONE	SLA	R1,4
+  CA0A   09C1           	SRL	R1,12
+                        ;
+                        ;	DIGIT TO ACCUMULATOR
+                        ;
+  CA0C   0A42           	SLA	R2,4
+  CA0E   A081           	A	R1,R2
+  CA10   05A0 C6F6      	INC	@BUFPNT
+  CA14   10E7           	JMP	LOOP
+                        ;
+  CA16   C042           NOTHEX	MOV	R2,R1
+  CA18   2DC0           	RET
+                        ;
+                        ;*****************************************************
+                        ; MESSAGES
+                        ;
+                        ;****************************************************
+  CA1A   2D2D 436C      ERRMSG1	TEXT	'--Close error'
+  CA1E   6F73 6520      
+  CA22   6572 726F      
+  CA26   72             
+  CA27   0D0A 00        	BYTE	0DH,0AH,0
+  CA2A   2D2D 5061      ERRMSG2 TEXT	'--Parse error'
+  CA2E   7273 6520      
+  CA32   6572 726F      
+  CA36   72             
+  CA37   0D0A 00        	BYTE	0DH,0AH,0
+  CA3A   2D2D 4D61      ERRMSG3 TEXT	'--Make error'
+  CA3E   6B65 2065      
+  CA42   7272 6F72      
+  CA46   0D0A 00        	BYTE	0DH,0AH,0
+  CA49   2D2D 5772      ERRMSG4 TEXT	'--Write error'
+  CA4D   6974 6520      
+  CA51   6572 726F      
+  CA55   72             
+  CA56   0D0A 00        	BYTE	0DH,0AH,0
+  CA59   2D2D 4669      ERRMSG5 TEXT	'--File too large error'
+  CA5D   6C65 2074      
+  CA61   6F6F 206C      
+  CA65   6172 6765      
+  CA69   2065 7272      
+  CA6D   6F72           
+  CA6F   0D0A 00        	BYTE	0DH,0AH,0
+  CA72                  	EVEN
+                        ;	
+                        ;*******************************************************
+                        ;
+                        ;	PROCEDURE INPUT
+                        ;
+                        ;******************************************************
+                        ;
+  CA72   0204 0040      PFETCH	LI	R4,CLSZ
+  CA76   C804 CD60      	MOV	R4,@CMDBYTES			;BYTES LEFT IN CMDLINE
+  CA7A   0204 0250      	LI	R4,CMDLINE	 		;NEXT CMDLINE DEST ADDR
+  CA7E   C804 CD5E      	MOV	R4,@CMDADDR	
+  CA82   04E0 CD70      	CLR	@SUBFLAG	
+                        ;
+                        ;	IS A NEW SECTOR NEEDED?
+                        ;
+  CA86   C120 CDD8      PLOOP	MOV	@MCNT,R4	 		;CHARS LEFT IN BUFFER
+  CA8A   1626           	JNE	BUFMOVE	 		;YES, MOVE NEXT CHAR
+                        ;
+                        ;ANY	MORE	SECTORS	IN THE FILE
+                        ;
+  CA8C   C120 CDCE      	MOV	@MFSZ,R4	
+  CA90   1321           	JEQ	PROCERR1			;NO,END OF FILE
+                        ;
+                        ;READ	NEXT	SECTOR
+                        ;
+  CA92   0203 0000      	LI	R3,DEFDRV
+  CA96   0202 000E      	LI	R2,SELDSK
+  CA9A   2DA0 D100      	CALL	@BDOS	 
+                        ;	LI	R3,MBUF	 			;USE THIS BUFFER
+  CA9E   0203 0300      	LI	R3,COMM_BUF	 			;USE THIS BUFFER
+  CAA2   0202 001A      	LI	R2,SETDMA
+  CAA6   2DA0 D100      	CALL	@BDOS	
+  CAAA   0203 0280      	LI	R3,FCB
+  CAAE   0202 0014      	LI	R2,RDSEQ	 		;READ 1 SECTOR<--
+  CAB2   2DA0 D100      	CALL	@BDOS		 		;
+  CAB6   C041           	MOV	R1,R1	 			;TROUBLE ?
+  CAB8   110B           	JLT	PROCERR0	 		;YES
+  CABA   0201 0200      	LI	R1,BLKSIZ	 		;INIT MCNT
+  CABE   C801 CDD8      	MOV	R1,@MCNT	 		;
+                        	;LI	R4,MBUF	 			;INIT NEXT BUFFER ADDR
+  CAC2   0204 0300      	LI	R4,COMM_BUF	 			;INIT NEXT BUFFER ADDR
+  CAC6   C804 CDDA      	MOV	R4,@MADDR	
+  CACA   0620 CDCE      	DEC	@MFSZ	 			;DECR PROC FILE SIZE(SECTORS LEFT)
+  CACE   1004           	JMP	BUFMOVE	
+  CAD0   0460 CC0A      PROCERR0	B	@SHELLERR
+  CAD4   0460 CC2C      PROCERR1	B	@UNPROC	
+                        ;
+                        ;-----MOVE NEXT	BYTE TO CMDLINE FROM PROC BUFFER
+                        ;
+  CAD8   C120 CDDA      BUFMOVE	MOV	@MADDR,R4	
+  CADC   D074           	MOVB	*R4+,R1	
+  CADE   C804 CDDA      	MOV	R4,@MADDR	
+  CAE2   0620 CDD8      	DEC	@MCNT	 		;DECR MCNT
+  CAE6   064A           	DECT	SP
+  CAE8   C681           	MOV	R1,*SP			;PUSH R1	 		;PUSH R1
+  CAEA   C020 CD70      	MOV	@SUBFLAG,R0			;PREV CHAR A SUBSTITUTION MARKER? 
+  CAEE   1621           	JNE	PARMSUB	 		;YES
+  CAF0   C07A           	MOV	*SP+,R1			;NO
+  CAF2   9801 C316      	CB	R1,@SUBMARK	 		;THIS CHAR A SUB MARKER?
+  CAF6   1603           	JNE	BUFMOV2	 		;NO
+  CAF8   0720 CD70      	SETO	@SUBFLAG	 		;YES,SET FLAG
+  CAFC   10C4           	JMP	PLOOP	 		;AND CONTINE
+  CAFE   9801 C30F      BUFMOV2	CB	R1,@EOF	 		;PDS EOF FLAG?
+  CB02   1313           	JEQ	BUFMOV4			;YES,EOF
+  CB04   9801 0000      	CB	R1,@PAD	 		;SMALL-VM PAD CHAR?
+  CB08   1310           	JEQ	BUFMOV4			;YES,EOF
+  CB0A   9801 C30D      BUFMOV3	CB	R1,@LF	 		;LF?
+  CB0E   13BB           	JEQ	PLOOP	 		;YES,IGNORE IT
+  CB10   C120 CD5E      BUFPUT	MOV	@CMDADDR,R4	 	;NEXT CMDLINE ADDR
+  CB14   D501           	MOVB	R1,*R4	
+  CB16   9801 C30C      	CB	R1,@CR	 		;CR?
+  CB1A   1332           	JEQ	PEOL	 		;YES,CMD IS FETCHED
+  CB1C   0584           	INC	R4	
+  CB1E   C804 CD5E      	MOV	R4,@CMDADDR	
+  CB22   0620 CD60      	DEC	@CMDBYTES	 	;CMDLINE BYTES LEFT
+  CB26   1303           	JEQ	MOVERR	  		;NO SPACE LEFT,ABORT PROC
+  CB28   10AE           	JMP	PLOOP	 		;YES,GO FOR NEXT BYTE
+  CB2A   0460 CC2C      BUFMOV4	B	@UNPROC	
+  CB2E   0460 CBFA      MOVERR	B	@LINERR	
+                        
+                        ;
+                        ;----PARAMETER	SUB(R1	ON	TOP OF STACK)
+                        ;
+  CB32   04E0 CD70      PARMSUB	CLR	@SUBFLAG	 		;CLEAR SUB FLAG
+  CB36   C07A           	MOV	*SP+,R1	 		;FETCH CAHR FOLLOWING SUBST MARKER
+  CB38   064A           	DECT	SP
+  CB3A   C681           	MOV	R1,*SP			;PUSH R0PUSH	R1	 		;AND SAVE IT AGAIN
+  CB3C   0981           	SRL	R1,8	
+  CB3E   0221 FFE0      	AI	R1,0FFE0H		;REDUCE ASCII BYTE TO INTEGER(-30)
+  CB42   1119           	JLT	NOSUB	 		;LT ZERO
+  CB44   0281 000A      	CI	R1,10	
+  CB48   1516           	JGT	NOSUB	 		;GT 9
+  CB4A   C081           	MOV	R1,R2	 		;PPTR OFFSET
+  CB4C   C07A           	MOV	*SP+,R1	 		;WASTE TOP OF STACK
+  CB4E   0204 CE7E      	LI	R4,PPTRS	 		;1ST PPTR ADDR
+  CB52   C0D4           SUBLOOP	MOV	*R4,R3	 		;R3=NEXT PPTR
+  CB54   1312           	JEQ	NULLPARM	
+  CB56   0602           	DEC	R2	
+  CB58   15FC           	JGT	SUBLOOP	
+                        ;
+                        ;-PPTR	FOUND
+                        ;
+  CB5A   D053           SUBLOOP2	MOVB	*R3,R1	 	;FETCH NEXT PARM CHAR
+  CB5C   9060 C309      	CB	@SPACE,R1	 	;END OF PARM(LE SPACE)?
+  CB60   1192           	JLT	PLOOP	 		;YES,CONTINUE
+  CB62   0583           	INC	R3	 		;BUMP PARM BYTE ADDR
+  CB64   C120 CD5E      	MOV	@CMDADDR,R4	 		;STORE BYTE IN CMDLINE
+  CB68   DD01           	MOVB	R1,*R4+	 		;ALSO BUMP BYTE ADDR
+  CB6A   C804 CD5E      	MOV	R4,@CMDADDR	
+  CB6E   0620 CD60      	DEC	@CMDBYTES	 		;DECR BYTES LEFT IN CMDLINE
+  CB72   1343           	JEQ	LINERR	 		;NO SPACE LEFT,ABORT PROC!
+  CB74   10F2           	JMP	SUBLOOP2	
+                        ;
+                        ;NON-NUMERIC	CHAR	FOLLOWS	SUBSTITUTION MARKER
+                        ;--TREAT	NORMAL
+                        ;
+  CB76   C07A           NOSUB	MOV	*SP+,R1	 		;RESTORE CHAR
+  CB78   10C2           	JMP	BUFMOV2	 		;AND CONTINUE
+                        ;
+                        ;-NO	PARAMETER	GIVEN	FOR SUBSTITUTION
+                        ;--SUB	NULL	STRING
+                        ;
+  CB7A   0201 0A00      NULLPARM	LI	R1,0A00H 			;FORCE BYTE TO BE SKIPPED
+  CB7E   10C5           	JMP	BUFMOV3	
+                        ;
+                        ;----END OF PROCEDURE LINE
+                        ;
+  CB80   D060 0250      PEOL	MOVB	@CMDLINE,R1	
+  CB84   9060 C310      	CB	@COMT,R1	 		;COMMENT?
+  CB88   1331           	JEQ	BPFETCH	 		;YES,IGNORE IT
+  CB8A   9060 C314      	CB	@NOTE,R1	 		;OPERATOR NOTE?
+  CB8E   1303           	JEQ	VIEW	 		;YES, DISPLAY THE LINE
+  CB90   C060 CD6C      	MOV	@VSW,R1	 		;VIEW SWITCH SET?
+  CB94   1304           	JEQ	CKNSW	 		;NO
+  CB96   0204 0250      VIEW	LI	R4,CMDLINE	 		;YES
+  CB9A   2DA0 CD50      	CALL	@OUTSTR	
+                        ;
+  CB9E   C060 CD6E      CKNSW	MOV	@NSW,R1	 		;NO-EXECUTE SWITCH SET?
+  CBA2   1624           	JNE	BPFETCH	 		;YES,GO FOR NEXT COMMAND LINE
+  CBA4   D060 0250      	MOVB	@CMDLINE,R1	 		;OPERATOR NOTE?
+  CBA8   9060 C314      	CB	@NOTE,R1	
+  CBAC   1621           	JNE	BTDOCMD	 		;NO;PROCESS THE COMMAND LINE
+  CBAE   0204 0250      	LI	R4,CMDLINE	
+  CBB2   0584           	INC	R4	
+  CBB4   9814 C314      	CB	*R4,@NOTE			;OPERATOR RESPONCE?
+  CBB8   1619           	JNE	BPFETCH			;NO
+  CBBA   0204 CE70      WAIT	LI	R4,WAITMSG	
+  CBBE   2DA0 CD50      	CALL	@OUTSTR
+  CBC2   04C1           	CLR	R1			;WAIT FOR A RESPONCE
+  CBC4   2DA0 0001      	CALL	@CIN			;<---
+                        	;PUSH	R1			;ECHO CR,LF
+  CBC8   064A           	DECT	SP
+  CBCA   C681           	MOV	R1,*SP			;;ECHO CR,LF
+                        
+  CBCC   D0E0 C30C      	MOVB	@CR,R3	
+  CBD0   2DA0 CD26      	CALL	@OUTCHAR	
+  CBD4   C07A           	MOV	*SP+,R1
+  CBD6   9801 C30C      	CB	R1,@CR			;CR?
+  CBDA   1308           	JEQ	BPFETCH			;YES,CONTINE
+  CBDC   9801 C304      	CB	R1,@CTLC			;^C?
+  CBE0   1325           	JEQ	UNPROC			;YES,ABORT PROC
+  CBE2   9801 C306      	CB	R1,@CTLS			;^S?
+  CBE6   16E9           	JNE	WAIT			;NO,KEEP WAITING
+  CBE8   0720 CD6A      	SETO	@SKIPSW			;SET SKIP SWITCH 
+  CBEC   0460 CA72      BPFETCH	B	@PFETCH			;FETCH NEXT PROC COMMAND 
+  CBF0   0460 C384      BTDOCMD	B	@DOCMD	
+                        ;
+                        ;-----ERROR	ROUTINES
+                        ;
+  CBF4   0204 0250      CMDERR	LI	R4,CMDLINE	
+  CBF8   1014           	JMP	ERROUT	
+  CBFA   C0A0 C30C      LINERR	MOV	@CR,R2	
+                        	;CALL	@OUTCHAR	
+  CBFE   0204 CE4F      	LI	R4,LINEMSG	
+  CC02   100F           	JMP	ERROUT	
+  CC04   0204 CE39      PARMERR	LI	R4,PARMSG	
+  CC08   100C           	JMP	ERROUT	
+  CC0A   0204 CE27      SHELLERR	LI	R4,SHELLMSG
+  CC0E   1009           	JMP	ERROUT	
+  CC10   0204 CE5F      HARDERR	LI	R4,HARDMSG	
+  CC14   1006           	JMP	ERROUT	
+  CC16   0204 CE0C      NULLERR	LI	R4,NULLMSG	
+  CC1A   1003           	JMP	ERROUT	
+  CC1C   0204 CE0F      NESTERR	LI	R4,NESTMSG	
+  CC20   1000           	JMP	ERROUT	 
+                        ERROUT:
+  CC22   2FA0 CE0D      	MESG	@QUESTMSG
+  CC26   2F94           	MESG	*R4
+  CC28   2FA0 C742      	MESG	@CRLF
+                        
+                        ;
+                        ;-----TERMINATE	PROCEDURE	PROCESSING
+                        ;
+  CC2C   04E0 CD68      UNPROC	CLR	@PROCSW	 		;CLEAR SWITCH 
+  CC30   0204 C39E      	LI	R4,CHKSYS	 	; 
+  CC34   05C4           	INCT	R4	 		;POINT TO COMPARE WORD
+  CC36   D520 C317      	MOVB	@SYSFILE,*R4		;REJECT FUTURE SYS FILE REFS
+  CC3A   0460 C60C      	B	@RETURN	 		;RESETS SP & GOES TO PROMPT
+                        ;
+                        ;----INITIATE	PROCEDURE	PROCESSING
+                        ;
+  CC3E   C060 CD68      DOPROC	MOV	@PROCSW,R1	 		;ALREADY IN A PROC?
+  CC42   16EC           	JNE	NESTERR	 		;YES,BUT CAN'T NEST THEM
+  CC44   0701           	SETO	R1	 		;NO,SET PROC SWITCH
+  CC46   C801 CD68      	MOV	R1,@PROCSW	
+  CC4A   0203 0280      	LI	R3,FCB			;SET PROC FDE FIELDS
+  CC4E   0204 CDBE      	LI	R4,MNAM			;DEST 
+  CC52   0202 0010      	LI	R2,16			; 
+  CC56   2DA0 CD12      	CALL	@BMOVE	
+  CC5A   04C4           	CLR	R4	 		;FORCE FIRST DISK READ
+  CC5C   C804 CDD8      	MOV	R4,@MCNT	
+                        ;
+                        ;---PARSE	PROCEDURE	PARAMETERS
+                        ;
+  CC60   04E0 CD6C      	CLR	@VSW	 		;CLEAR VIEW SWITCH
+  CC64   04E0 CD6E      	CLR	@NSW	 		;CLEAR NO-EXECUTE SWITHC
+  CC68   0204 CE7E      	LI	R4,PPTRS	 		;INIT PPADDR
+  CC6C   C804 CED4      	MOV	R4,@PPADDR	
+  CC70   0203 CE94      	LI	R3,PBUF	 		;INIT DEST ADDR (R3)
+  CC74   0204 0250      	LI	R4,CMDLINE	 		;INIT SOURCE ADDR (R4)
+  CC78   0202 000A      	LI	R2,10	 		;MAX PARMS ALLOWED 
+  CC7C   04C0           	CLR	R0	 		;R0 = WORD SWITCH(ZERO BETWEEN WORDS)
+  CC7E   04C1           PARSLOOP	CLR	R1	
+  CC80   D074           	MOVB	*R4+,R1			;LOAD NEXT BYTE
+  CC82   0281 2D00      	CI	R1,2D00H 		;CMD LINE SWITCH(-)?
+  CC86   161A           	JNE	PARS1	 		;NO
+  CC88   C000           	MOV	R0,R0	 		;BEGINNING OF WORD?
+  CC8A   1616           	JNE	PARS0B	 		;NO,CONTINUE
+  CC8C   0584           	INC	R4	
+  CC8E   D054           	MOVB	*R4,R1	 		;TEST 3RD BYTE
+  CC90   0604           	DEC	R4	
+  CC92   0281 2000      	CI	R1,2000H 		;SPACE OR CTL CHAR?
+  CC96   1B10           	JH	PARS0B	 		;NO,CONTINUE
+  CC98   D054           	MOVB	*R4,R1	 		;TEST 2ND BYTE
+  CC9A   0281 5600      	CI	R1,5600H 		;-V?
+  CC9E   1604           	JNE	PARS0A	 		;NO
+  CCA0   C801 CD6C      	MOV	R1,@VSW	 		;YES,SET VIEW SWITCH
+  CCA4   0584           PARS0	INC	R4	 		;AND DROP SWITCH FROM THE COMMAND
+  CCA6   10EB           	JMP	PARSLOOP	
+  CCA8   0281 4E00      PARS0A	CI	R1,4E00H 		;-N?
+  CCAC   1605           	JNE	PARS0B	 		;NO-CONTINUE
+  CCAE   0201 2D00      	LI	R1,2D00H 		;RESTORE CHAR
+  CCB2   C801 CD6E      	MOV	R1,@NSW	 		;YES-SET NO EXECUTE SWITCH
+  CCB6   10F6           	JMP	PARS0	 		;
+  CCB8   0201 2D00      PARS0B	LI	R1,2D00H		;RESTORE CHAR 
+                        ;
+                        ;
+  CCBC   DCC1           PARS1	MOVB	R1,*R3+	
+  CCBE   0281 0D00      	CI	R1,0D00H 		;END OF LINE?
+  CCC2   1323           	JEQ	PARSEND	 		;YES
+  CCC4   0281 2000      	CI	R1,2000H 		;SPACE OR CTL CHAR?
+  CCC8   1B04           	JH	PARS2	 		;NO
+  CCCA   C000           	MOV	R0,R0	 		;YES,WORD SWITCH CLEAR?
+  CCCC   13D8           	JEQ	PARSLOOP	 		;YES,CONTINUE
+  CCCE   04C0           	CLR	R0	 		;NO,CLEAR IT AND CONTINUE
+  CCD0   10D6           	JMP	PARSLOOP	
+                        ;
+  CCD2   C000           PARS2	MOV	R0,R0	 		;IS WORD SWITCH SET?
+  CCD4   16D4           	JNE	PARSLOOP	 		;YES,CONTINUE
+  CCD6   0700           	SETO	R0			;NO,SET IT
+  CCD8   0602           	DEC	R2	 		;WILL NEXT PARM FIT PPTRS ARRAY?
+  CCDA   1194           	JLT	PARMERR	 		;NO
+                        ;
+                        ;	LOAD NEXT PARM PTR
+                        ;
+  CCDC   064A           	DECT	SP
+  CCDE   C684           	MOV	R4,*SP	 		;SOURCE
+  CCE0   064A           	DECT	SP
+  CCE2   C683           	MOV	R3,*SP	 		;DEST
+  CCE4   0603           	DEC	R3	
+  CCE6   D054           	MOVB	*R4,R1			;2ND SOURCE CHAR<=SPACE?
+  CCE8   0281 2000      	CI	R1,2000H	
+  CCEC   1506           	JGT	PARS3	 		;NO CAN'T BE NULL PARAMETER
+  CCEE   9813 C312      	CB	*R3,@NULPARM			;1ST DEST CHAR A NULL PARAMETER?
+  CCF2   1603           	JNE	PARS3	 		;NO
+  CCF4   0201 2000      	LI	R1,2000H 		;YES,FORCE PARM DELIMITER
+  CCF8   D4C1           	MOVB	R1,*R3	
+  CCFA   C120 CED4      PARS3	MOV	@PPADDR,R4	 
+  CCFE   CD03           	MOV	R3,*R4+	
+  CD00   C804 CED4      	MOV	R4,@PPADDR	
+  CD04   C0FA           	MOV	*SP+,R3	 		;DEST
+  CD06   C13A           	MOV	*SP+,R4	 		;SOURCE
+  CD08   10BA           	JMP	PARSLOOP
+                        ;
+                        ;-----TERMINATE	PARSING
+                        ;
+  CD0A   04E0 CED4      PARSEND	CLR	@PPADDR			;CAP PPTRS WITH A NULL WORD
+  CD0E   0460 CA72      	B	@PFETCH	 		;GO PROCESS THE PROC
+                        ;
+                        ;----BLOCK	MOVE	ROUTINE
+                        ;
+  CD12   DD33           BMOVE	MOVB	*R3+,*R4+	
+  CD14   0602           	DEC	R2	
+  CD16   16FD           	JNE	BMOVE	
+  CD18   2DC0           	RET	
+                        ;
+                        ;INPUT	CHAR INTO MSB OF R1
+                        ;
+  CD1A   0202 0001      INCHAR	LI	R2,CIN	 		; 
+  CD1E   2DA0 D100      	CALL	@BDOS	 		;GET CHAR
+  CD22   06C1           	SWPB	R1			;PLACE CHAR IN MSB
+  CD24   2DC0           	RET	 		;
+                        ;
+                        ;	
+                        ;   OUTPUT CHAR IN MSB OF R3 TO THE CONSOLE
+                        ;   CHARACTER RETURNED IN MSB OF R1
+                        ;   AUTO LF
+                        ;
+  CD26   064A           OUTCHAR	DECT	SP
+  CD28   C683           	MOV	R3,*SP		;SAVE CHAR
+  CD2A   06C3           	SWPB	R3		;DOS PRINTS LSB BYTE
+  CD2C   0202 0002      	LI	R2,COUT	 	;
+  CD30   2DA0 D100      	CALL	@BDOS
+  CD34   C0FA           	MOV	*SP+,R3
+  CD36   9803 C30C      	CB	R3,@CR	 	;CR?
+  CD3A   1609           	JNE	OUT0	 	;NO
+  CD3C   D0E0 C30D      	MOVB	@LF,R3	 	;YES,GENERATE LF
+  CD40   06C3           	SWPB	R3		;DOS PRINTS LSB BYTE
+  CD42   0202 0002      	LI	R2,COUT
+  CD46   2DA0 D100      	CALL	@BDOS
+  CD4A   0203 0D0A      	LI	R3,0D0AH		;DONE FOR SHELL
+  CD4E   2DC0           OUT0	RET
+                        ;
+                        ;----OUTPUT	A STRING TO THE CONSOLE
+                        ;
+  CD50   D0D4           OUTSTR	MOVB	*R4,R3
+  CD52   1304           	JEQ	STR0	
+  CD54   0584           	INC	R4	
+  CD56   2DA0 CD26      	CALL	@OUTCHAR	
+  CD5A   10FA           	JMP	OUTSTR	
+  CD5C   2DC0           STR0	RET
+                        
+                        ;
+                        ;
+                        ;----MISC	VARIABLES
+                        ;
+  CD5E   0000           CMDADDR	WORD	0			;CUR CMDLINE ADDR
+  CD60   0000           CMDBYTES	WORD	0	 		;CMDLINE BYTES LEFT
+  CD62   0000           DOSV	WORD	0	 		;DOS WARM START VECTOR
+  CD64   0000           HDERRV	WORD	0	 		;DOS HARD ERROR VECTOR
+  CD66   0000           DOSERRV	WORD	0	 		;DOS FILENAME ERROR VECTOR
+  CD68   0000           PROCSW	WORD	0			;PROC SWITCH
+  CD6A   0000           SKIPSW	WORD	0			;SKIP NEXT PROC CMD
+  CD6C   0000           VSW	WORD	0			;VIEW SWITCH
+  CD6E   0000           NSW	WORD	0			;NO-EXECUTE SWITCH
+  CD70   0000           SUBFLAG	WORD	0	 		;PARM SUBST FLAG
+  CD72   0000           LADDR	WORD	0	;
+                        ;
+                        ;-----SHELL COMMAND LINE2
+                        ;
+  CD74   0000           VMENTRY	WORD	0			;CONTROLS SMALL-VM PROG REENTRY FEATURE
+  CD76   2A42 4F4F      CMDLINE2	TEXT	"*BOOT"
+  CD7A   54             
+  CD7B   0D00           	BYTE	0DH,00
+  CD7D   00             	EVEN
+  CD7E                  	BSS	CLSZ	 		;COMMAND BUFF
+  CDBE                  	EVEN
+                        ;
+                        ;----PROCEDURE	FDE & BUFFER FIELDS 
+                        ;
+  CDBE                  	EVEN
+  CDBE                  MNAM	BSS	NAMSIZ			;
+  CDC9   00             	EVEN
+  CDCA                  	BSS	2	 		;RIB
+  CDCC                  	EVEN
+                        ;
+  CDCC   0000           MFTY	WORD	0			;
+  CDCE   0000           MFSZ	WORD	0			;SECTORS REMAINING 
+                        ;MNRR	WORD	0	 		;NRR
+                        ;MCBF	WORD	0
+                        ;MTSC	WORD	0
+                        ;MDRV	WORD	0	 		;DRIVE #
+  CDD0                  	BSS	8			;PART OF FRI (SPARE)	
+                        ;MBUF:	BSS	BUFFSIZ+2			;PROC BUFFER 1 SECTOR
+  CDD8   0000           MCNT	WORD	0			;BYTES LEFT IN BUFFER
+  CDDA   0000           MADDR	WORD	0			;CURRENT BUFFER BYTE ADDR 
+                        ;
+                        ;----MESSAGES
+                        ;
+  CDDC   0D0A           SINON	BYTE	0DH,0AH
+  CDDE   5368 656C      	TEXT	'Shell Version 4.9'
+  CDE2   6C20 5665      
+  CDE6   7273 696F      
+  CDEA   6E20 342E      
+  CDEE   39             
+  CDEF   0D0A           	BYTE	0DH,0AH
+  CDF1   5265 6C65      	TEXT	'Release date 6 April 2026'
+  CDF5   6173 6520      
+  CDF9   6461 7465      
+  CDFD   2036 2041      
+  CE01   7072 696C      
+  CE05   2032 3032      
+  CE09   36             
+  CE0A   0D0A           	BYTE	0DH,0AH
+  CE0C   00             NULLMSG 	BYTE 	0
+                        ;
+  CE0D   3F             QUESTMSG 	TEXT 	"?"
+  CE0E   00             	BYTE	0
+                        ;
+  CE0F   5072 6F67      NESTMSG	TEXT	"Program name expected:"
+  CE13   7261 6D20      
+  CE17   6E61 6D65      
+  CE1B   2065 7870      
+  CE1F   6563 7465      
+  CE23   643A           
+  CE25   0D00           	BYTE 	0DH,00
+                        ;
+  CE27   5368 656C      SHELLMSG 	TEXT 	"Shell error:"
+  CE2B   6C20 6572      
+  CE2F   726F 723A      
+  CE33   0D00           	BYTE	0DH,00H
+                        ;
+  CE35   0820 0800      RUBMSG	BYTE	08H,20H,08H,0
+                        ;
+  CE39   546F 6F20      PARMSG	TEXT	"Too many parameters:"
+  CE3D   6D61 6E79      
+  CE41   2070 6172      
+  CE45   616D 6574      
+  CE49   6572 733A      
+  CE4D   0D00           	BYTE	0DH,00
+                        ;
+  CE4F   4C69 6E65      LINEMSG	TEXT	"Line too long:"
+  CE53   2074 6F6F      
+  CE57   206C 6F6E      
+  CE5B   673A           
+  CE5D   0D00           	BYTE	0DH,00
+                        ;
+  CE5F   4861 7264      HARDMSG	TEXT	"Hard disc error"
+  CE63   2064 6973      
+  CE67   6320 6572      
+  CE6B   726F 72        
+  CE6E   0D00           	BYTE	0DH,00
+                        ;
+  CE70   2D2D 7761      WAITMSG	TEXT	"--waiting..."
+  CE74   6974 696E      
+  CE78   672E 2E2E      
+  CE7C   00             	BYTE	0
+                        ;
+                        ;----PARAMETER	POINTERS,BUFFER	ETC.
+                        ;
+  CE7D   00             	EVEN
+  CE7E                  PPTRS	BSS	22	 	;11 WORDS 
+  CE94                  PBUF	BSS	64	 	;PARM BUUFER 
+  CED4   0000           PPADDR	WORD	0		;ADDR OF CUR PARM PTR
+                        ;FCB	BSS	36 		;FCB MUST BE 36 BYTES LONG
+                        
+  CED6                  	END
+
+1 error(s).
+LOOKERR          C420  ERRMSG1          CA1A  MNAM             CDBE  COMT             C310  
+GETSEG           C4B2  PPTRS            CE7E  EXE              0002  STR0             CD5C  
+COMM_FCB         0280  PBUF             CE94  EXIT             C8DE  PARSENAME        C4C6  
+CCOUNT           C750  SUBLOOP2         CB5A  PARMSG           CE39  SP               000A  
+PRO              0005  L_START          C404  EXEC             0002  GOLOOP           C5A4  
+CMDLINE          0250  SHELL_PTR        0080  DEFDRV           0000  CINLOOP          C64E  
+NAM              0000  FAR_REF          2C00  ERA1             C938  FCB              0280  
+LOAD2            C53C  EXTSIZ           0003  PROC             0005  FSB              000C  
+CMDLINE2         CD76  R12              000C  DSKSAVE          C7F4  PRINTFCB         C448  
+NAM2             C844  FINDDOT          C4E2  NAM5             C884  OUTSTR           CD50  
+ERAE             C978  PADRETS          C474  PARS2            CCD2  MFTY             CDCC  
+DSKDIR           C752  GETEXT           C506  SADDR            C6FA  SINON            CDDC  
+NEXTEXT          C50E  PLOOP            CA86  CMDLOOP          C32A  CHKCHAR          C476  
+VIEW             CB96  PNAME            C798  BTDOCMD          CBF0  MONITOR          F000  
+DCOMR            0001  SUBFLAG          CD70  JUMP             C311  LOAD0            C548  
+DOSV             CD62  BMOVE            CD12  DSKDIR1          C782  WRDATA           C8A4  
+WRITE            2F00  MEMLIMIT         00B0  EXT_END          C504  PNAME1           C7AA  
+BUFMOV2          CAFE  PNAME2           C7B0  TXT              0003  PNAME3           C7DA  
+FCLOSE           0010  SEGNUM           C6FC  WRITERR          C982  EXT              C313  
+POPREG           2D40  SSWEXIT          C4C0  PADLOOP          C46C  NULPARM          C312  
+R1               0001  OUTCHAR          CD26  R3               0003  PARS0            CCA4  
+R5               0005  SKIPSW           CD6A  R8               0008  PROMPT           C63E  
+MAKFIL           0016  GO               C5CA  CALL             2D80  BAS              0004  
+CRLF             C742  BPFETCH          CBEC  START02          C810  TPA              0500  
+CTLS             C306  BLKSIZ           0200  R15              000F  BUFPNT           C6F6  
+CTLY             C307  PARS0A           CCA8  INVALID          C498  PARS0B           CCB8  
+VMENTRY          CD74  PARMERR          CC04  SPACEPAD         C4C0  PARSE1           C4D0  
+FLA              0010  LOADER           0400  SPACE            C309  CR               C30C  
+R11              000B  CBN              0018  MESG             2F80  PARSERR          C7F0  
+WAIT             CBBA  BUFMOV4          CB2A  PARSEND          CD0A  CHRM             C502  
+MFSZ             CDCE  CIN              0001  ATOD00           C9BC  QUESTMSG         CE0D  
+COMM_BUF         0300  STOWIT           C670  PROCSW           CD68  PARSLOOP         CC7E  
+ATOD04           C9D4  CHRS             C503  PARS3            CCFA  CHRT             C501  
+WHEX             2E80  MADDR            CDDA  BANNER           F004  CRN              001A  
+PUSHREG          2D00  NAMSRCH          C868  PAD              0000  RUBMSG           CE35  
+VSW              CD6C  LARGERR          C9A0  VALID            C494  RET              2DC0  
+NULLPARM         CB7A  CHKSYS           C39E  BS               C30B  NOTHEX           CA16  
+DEL              C30E  NOSUB            CB76  HALT             10FF  INIT_LOADER      C5CE  
+SEG_SWITCH       C4A0  BUFFSIZ          0200  WRSEQ            0015  LBA              00A8  
+ERRMSG5          CA59  NESTMSG          CE0F  GOPROG           C59A  BDOS             D100  
+WAITMSG          CE70  ERRMSG2          CA2A  SYSFILE          C317  WORKSP           0230  
+ATOD             C9B6  CATOH            C9E2  NOFILE           C7E6  SSWERR           C4C2  
+R14              000E  ICMD0            C70C  LDS              0780  HDERR            0000  
+PUSH             2E00  DOPROC           CC3E  MOVERR           CB2E  RECCNT           C6F8  
+R10              000A  BUFMOVE          CAD8  ERA2             C94C  HARDERR          CC10  
+MNOFILE          C745  LOADERCODE       C5E0  PROM             C315  START00          C808  
+ERA3             C950  ECHO             C69E  PFETCH           CA72  LOAD             C528  
+MCNT             CDD8  ICMDE            C73C  LOOP             C9E4  NULLERR          CC16  
+RHEX             2EC0  RETURN           C60C  GOTONE           CA08  SSWITCH          C6FF  
+READ             2F40  STACKP           EF00  RUBOUT           C6B0  SETDMA           001A  
+BUFF_PTR         00A4  HDERRV           CD64  ICMD2            C730  EXTOFF           0008  
+R0               0000  NOTE             C314  R4               0004  SWITCH           C6FE  
+R9               0009  NEXTCMD          C634  CTLC             C304  DDEN             0001  
+END_LOADER       C60C  UNPROC           CC2C  CTLX             C305  ERAFILE          C8E8  
+PFCL1            C460  DIREXIT          C7DC  FSZ              000E  LF               C30D  
+INIT22           C350  FILLNAME         C4DE  LOAD3            C544  RELB             001C  
+BUFPUT           CB10  LOAD1            C56A  ATOD03           C9D0  BYTSEC           0200  
+L_FOUND          C424  RELR             001E  BDOS_PTR         0084  CMDPTR           00A0  
+CMDCNT           0004  CLOSERR          C992  BAR              C73E  PARS1            CCBC  
+COUT             0002  FREEMEM          00A6  LDD              07C0  DOCMD2A          C3BE  
+BUFMOV3          CB0A  DOCMDAA          C3B2  COM              0001  PREPARSE         C832  
+INCHAR           CD1A  CONSOLE          0000  PRINTCMDL        C458  LINERR           CBFA  
+OUT0             CD4E  SETFLAG          C49C  LINEMSG          CE4F  CKNSW            CB9E  
+NULLMSG          CE0C  ICMD             C700  ERA4             C958  ERROUT           CC22  
+NAM3             C878  CMDBYTES         CD60  DOSERRV          CD66  SEARCH1          0011  
+ERA01            C904  ICLIST           C6DC  DOSERR           0000  SHELL            C300  
+CMDL_SIZE        00A2  CLSZ             0040  SHELLMSG         CE27  IL0              C5D6  
+R6               0006  FOPEN            000F  EOF              C30F  SUBMARK          C316  
+CTLZ             C308  DSKDIR0          C768  EXT_TAB          C4F8  MKERR            C988  
+SELDSK           000E  CMDADDR          CD5E  GODOCMD          C6CA  ERAFIL           0013  
+PADSPACE         C468  DOCMD            C384  SLA              C5F2  PARSMSG          C998  
+NESTERR          CC1C  MKERR2           C9A6  WP               000D  CMDL_PTR         00A0  
+SUBLOOP          CB52  DOSCMD           C318  FTY              000B  ERRMSG3          CA3A  
+PEOL             CB80  DOCMD1           C3A8  LOOK             C3E0  DOCMD2           C3B8  
+PARMSUB          CB32  DOCMD3           C3D6  R2               0002  INIT             C31A  
+PFCB1            C450  PROCERR1         CAD4  CALL_FAR         2CC0  CIOERR           C6D8  
+CMDERR           CBF4  DOCMD4           C3C2  DEBUG            2FC0  ICMD1            C72C  
+NSW              CD6E  DOCMD9           C3DC  ERA0             C8FC  WRDATAC          C8D2  
+SEARCH2          0012  ERAPERR          C8E4  RDSEQ            0014  PROCERR0         CAD0  
+FILLEXT          C522  NAMSIZ           000B  LADDR            CD72  SHELLERR         CC0A  
+POP              2E40  PPADDR           CED4  HARDMSG          CE5F  ERRMSG4          CA49  
+L_TRY            C3F8  STOWIT2          C68A  TYPEFILE         C97E  FCB_PTR          00AC  
+

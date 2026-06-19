@@ -7,145 +7,168 @@
 
 ------------------------------------------------------------------------
 
-## Table of Contents
-
--   [Overview](#overview)
--   [Historical Background](#historical-background)
--   [TMS9900 Version](#tms9900-version)
--   [Shell Prompt](#shell-prompt)
--   [Commands](#commands)
-    -   [%DIR](#dir)
-    -   [%ERA](#era-filename)
-    -   [%SAVE](#save-n-filename--hexloadaddress)
--   [Executing Programs](#executing-programs)
--   [Load Without Executing](#load-without-executing)
--   [Running in Alternate Memory
-    Segments](#running-in-alternate-memory-segments)
-
-------------------------------------------------------------------------
+# TMS99105 SBC Shell — SHELLV56
 
 ## Overview
 
-**Small-Shell-for-the-TMS9900** is a compact command processor for DOS
-on a TMS9900 CP/M-like system.
+The shell is the command processor for the TMS99105 SBC. It runs in protected memory at `0xD000`, accepts commands at the `%` prompt, and manages program loading into the paged memory system.
 
-It provides a simple and efficient user interface for interacting with
-the operating system and managing disk-based programs.
+---
 
-------------------------------------------------------------------------
+## Memory Layout
 
-## Historical Background
+```
+0x0000-0x00AF  Interrupt vectors
+0x00B0-0x012F  Interrupt workspace
+0x0130-0x022F  XOP workspace
+0x0230-0x024F  Shell workspace (R0-R15)
+0x0250-0x027F  Command line buffer
+0x0280-0x029B  FCB
+0x02A0-0x02FF  Page variables / overlay manager
+0x0300-0x04FF  LOADERCODE (runs from COMMON)
+0x0500-0x06FF  STAGING buffer (512 bytes)
+0x1000-0xBFFF  TPA — paged program area
+0xD000         SHELL
+0xE000         BDOS
+0xF000         ROM / DISC_MONITOR
+```
 
-This project is based on James Hendrix's 8080 Small VM/Shell, originally
-written to complement North Star DOS.
+### Key Vectors (COMMON)
 
-It was featured in a 1982 article in Volume 7, Number 63 of *Dr. Dobb's
-Journal*.\
-The original article provides a full description of the procedural
-command structure.
+```
+0x0080  BLWP @SHELL_PTR  — return to shell
+0x0084  BLWP @BDOS_PTR   — BDOS entry
+```
 
-Archived article:
-https://ia600109.us.archive.org/17/items/dr_dobbs_journal_vol_07_201803/dr_dobbs_journal_vol_07.pdf
+---
 
-------------------------------------------------------------------------
+## Command Dispatch
 
-## TMS9900 Version
+1. Shell reads input into command line buffer (`0x0250`)
+2. `PARSENAME` fills the FCB with the command name
+3. `ICMD` scans `ICLIST` for a matching internal command
+4. If not found, searches disk for `command.COM`
+5. Loads and runs the program
+6. On return via `BLWP @0x0080`, returns to `%` prompt
 
-This version:
+---
 
--   Preserves the original structure and design philosophy
--   Has been rewritten for a **TMS9900 CP/M-like system**
--   Adds CP/M-style disk commands:
-    -   `DIR`
-    -   `SAVE`
-    -   `ERA`
+## Internal Commands
 
-------------------------------------------------------------------------
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `DIR` | `%DIR` | List all files on disk |
+| `SAVE` | `%SAVE n filename` | Save n sectors of memory to file |
+| `ERA` | `%ERA filename` | Erase a file |
+| `TYPE` | `%TYPE filename` | Display file (stub) |
+| `LOAD` | `%LOAD filename.COM` | Load overlay into paged memory |
 
-## Shell Prompt
+---
 
-The Shell prompt character is:
+## Program Loading
 
-    %
+### Flat Binary
 
-------------------------------------------------------------------------
+A raw binary with no pagemap header. Loaded directly to `FLATBASE` (`0x1000`) in segment 1 page 0 and executed.
 
-## Commands
+### Paged Binary
 
-### `%DIR`
+A `.COM` file with a pagemap header (sentinel `FFFF FFFF FFFF` at byte offset 6):
 
-Lists the disk directory.
+```
+FFFF FFFF FFFF          opening sentinel
+vstart vend  page       pagemap entry (virtual start, end, physical page)
+FFFF FFFF FFFF          closing sentinel
+size                    block size in bytes
+[code bytes...]
+```
 
-Example:
+The loader:
+1. Parses pagemap entries
+2. Programs the 6116 mapper via `MAP_SET` for each segment
+3. Enables PSEL and copies code to the virtual address
+4. Disables PSEL and launches the program
 
-    %DIR
+### LOAD Command (overlays)
 
-------------------------------------------------------------------------
+`%LOAD filename.COM` loads a paged binary **without executing it**:
+- Assigns the next overlay ID (`OVL_COUNT++`)
+- Stores physical page in `OVL_PAGE_TAB[ID]`
+- Stores virtual segment in `OVL_SEG_TAB[ID]`
+- Prints `Loaded as overlay N`
+- Returns to shell prompt
 
-### `%ERA FileName`
+---
 
-Erases a file from the disk directory.
+## Mapper Programming
 
-Example:
+### MAP_SET
 
-    %ERA TEST.TXT
+Programs one 6116 mapper register via CRU:
 
-------------------------------------------------------------------------
+```asm
+; R9 = segment, R0 = physical page
+MAP_SET:
+    LI   R12,MAP_WIN_BASE    ; 0x80C0
+    SLA  R9,1                ; segment * 2 = CRU offset
+    A    R9,R12
+    SLA  R0,8                ; page to HIGH BYTE (LDCR uses high byte)
+    LDCR R0,BYTEWIDE         ; program register
+    RT
+```
 
-### `%SAVE N FileName -HexLoadAddress`
+### MAP_INIT
 
-Saves memory contents (typically an executable) to disk.
+Clears all 16 mapper registers to page 0. Called at shell entry and before loading a new program.
 
--   `N` = number of 512-byte blocks
--   Total bytes written = `N × 512`
--   `HexLoadAddress` = starting address (hexadecimal)
+### PSEL
 
-Example:
+PSEL is controlled via XOP 2. With PSEL enabled, SA0-SA3 from the 6116 select the mapped physical page. With PSEL disabled, SA0-SA3 are forced low — all segments map to page 0 (COMMON).
 
-    %SAVE 6 XMODEM -0100
+```asm
+LI   R9,PSEL_EN    ; enable
+PSEL R9
 
-This writes 3 KB (6 × 512 bytes) starting at address `0100H` to disk as
-`XMODEM`.
+CLR  R9            ; disable
+PSEL R9
+```
 
-------------------------------------------------------------------------
+---
 
-## Executing Programs
+## Overlay Manager Variables (0x02A0-0x02FF)
 
-After saving, execute a program by typing its name:
+Populated by `%LOAD` and used by OVLMGR:
 
-    %XMODEM FileName
+```
+0x02A0  OVL_PRINT_VEC    Print callback address for overlays
+0x02A2  OVL_COUNT        Number of overlays loaded
+0x02A4  OVL_PAGE_TAB     16 words: physical page per overlay ID
+0x02C4  OVL_SEG_TAB      16 words: virtual segment per overlay ID
+0x02E4  OVL_CURR_ID      Currently mapped overlay ID
+0x02E6  OVL_CURR_SEG     Currently mapped segment
+```
 
-This example runs `XMODEM`, receives a file, and saves it to disk as
-`FileName`.
+---
 
-------------------------------------------------------------------------
+## Interrupt Handling
 
-## Load Without Executing
+Seven interrupt vectors at `0x00B0` are initialised at boot to `INT_SAFE` (`RTWP`) so unexpected interrupts are silently handled.
 
-To load a program into memory without executing it, prefix the filename
-with a period:
+Before launching any program, `INT2_HANDLER` is installed at `0x000A`. On a privilege violation or illegal opcode (INT2 NMI), it dumps:
 
-    %.XMODEM
+```
+INT2 PC:xxxx WP:xxxx ST:xxxx
+MAP:ssss ssss ... (all 16 mapper registers)
+```
 
-This loads the file into memory and returns to the Shell.\
-Useful for inspection or patching.
+---
 
-------------------------------------------------------------------------
+## Version History
 
-## Running in Alternate Memory Segments
-
-By default, programs execute in segment 0.
-
-To run in another segment (e.g., segment 1):
-
-    FileName -1
-
-When the Shell detects `-1`, it:
-
-1.  Creates a loader in common memory
-2.  Moves the object file into the specified segment
-3.  Transfers control for execution
-
-------------------------------------------------------------------------
-
-
+| Version | Changes |
+|---------|---------|
+| 4.0 | Initial TMS9900 port of Small/Shell |
+| 4.6 | Internal commands: DIR, SAVE, ERA |
+| 5.4 | Paged memory loader; transparent GAL mapping |
+| 5.5 | MAP_SET/MAP_INIT; multi-sector loading; INT2 debug handler |
+| 5.6 | DOLOAD command; overlay manager variables; interrupt vector init |

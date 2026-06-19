@@ -73,7 +73,7 @@ A raw binary with no pagemap header. Loaded directly to `FLATBASE` (`0x1000`) in
 
 ### Paged Binary
 
-A `.COM` file with a pagemap header (sentinel `FFFF FFFF FFFF` at byte offset 6):
+A `.COM` file (produced with link99) with a pagemap header (sentinel `FFFF FFFF FFFF` at byte offset 6):
 
 ```
 FFFF FFFF FFFF          opening sentinel

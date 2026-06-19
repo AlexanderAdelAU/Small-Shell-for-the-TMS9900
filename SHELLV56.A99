@@ -1,0 +1,1765 @@
+;
+;*******************************************************************
+;
+;  TMS99105 SBC V4 - Memory Map
+;
+;  Address   Label      Purpose
+;  >0230     SH_WP      Shell Workspace: R0-R15
+;  >0250     SH_CMD     Command Line: raw input string
+;  >0280     CM_FCB     FCB (36 bytes)
+;  >02A4     CM_VARS    Bridge Variables: pointers, status flags
+;  >0300     CM_BUF     512-byte Sector Buffer / LOADERCODE area
+;
+;  Paged Memory Model (Rev 5.5):
+;  Segment 0  (0x0000-0x0FFF)  COMMON  - always page 0, transparent
+;  Segments 1-11 (0x1000-0xBFFF) PAGED - mapped via 6116 + GAL
+;  Segments 12-15 (0xC000-0xFFFF) PROTECTED - shell/BDOS/ROM
+;
+;  6116 mapper programmed via CRU (LDCR/STCR) at MAP_WIN_BASE.
+;  PSEL XOP 2 enables/disables the GAL page select output.
+;  With PSEL active, SA0-SA3 from 6116 gate physical RAM bank.
+;  XOP calls execute with PSEL disabled (transparent) - safe
+;  because workspace is always in segment 0 (COMMON).
+;
+;*******************************************************************
+;
+;  Original Version:
+;  Small/Shell 1.0 - A command processor for North Star DOS
+;  Copyright 1981 J.E. Hendrix, All rights reserved
+;  Written for PDS assembler
+;
+;  TMS9900 Port and Modern Revisions:
+;
+;  4.0   Initial TMS9900 version
+;  4.1   Filename extension handling (4 June 2010)
+;  4.6   Internal commands: DIR, SAVE, ERA
+;  4.7   Multisegment alignment; RETURN changed to RETF
+;  4.9   Intermediate paging work
+;
+;  5.4   Paged memory loader - first working version
+;        Transparent GAL mapping - no trampolines, no LDS/LDD
+;        LOADERCODE replaced with link99 v3.9 page map loader
+;        Sentinel detection: FFFF FFFF FFFF at file offset 6
+;        COM/EXE go direct to LOADERCODE (no pre-read)
+;        MAP_INIT called at shell entry and LOADERCODE entry
+;        .FILENAME load-only restored (reads flat, returns to prompt)
+;        R8 saves launch address across LDRCPY walk
+;        LDRRUN_F for raw/flat binaries
+;
+;  5.5   Paged memory loader - production version (June 2026)
+;        MAP_SET/MAP_INIT getter-setter pattern established
+;        LDRSEG calls MAP_SET - no inline CRU bit manipulation
+;        R8 saved in LDRPM before MAP_SET clobbers R9
+;        Multi-sector loading: LDRSEC direct DMA to paged memory
+;        BDOS passes DMA address unchanged through page mapper
+;        INT2_HANDLER: full debug dump (PC/WP/ST + map registers)
+;        INT2_VEC installed before every paged launch
+;        Paged execution confirmed: HELLO runs from seg 2 page 2
+;        Transparent memory model: XOPs safe from paged code
+;        Segment 0 COMMON always page 0 - workspace always visible
+;
+;*******************************************************************
+
+R0	EQU	0
+R1	EQU	1
+R2	EQU	2
+R3	EQU	3
+R4	EQU	4
+R5	EQU	5
+R6	EQU	6
+R7	EQU	7
+R8	EQU	8
+R9	EQU	9
+R10	EQU	10
+R11	EQU	11
+R12	EQU	12
+WP	EQU	13
+R13	EQU	13
+R14	EQU	14
+R15	EQU	15
+SP	EQU	10
+;
+;----Define  Extended Operations
+;
+	DXOP	PSEL,2			;ENABLE/DISABLE PAGE MAPPER
+	DXOP	PUSHREG,4
+	DXOP	POPREG,5
+	DXOP	CALL,6
+	DXOP	RET,7
+	DXOP	PUSH,8
+	DXOP	POP,9
+	DXOP	WHEX,10			;WRITE OUT A 16 BIT HEX VALUE
+	DXOP	RHEX,11			;READ IN A 16 BIT HEX VALUE
+	DXOP	WRITE,12		;WRITE CHAR IN MSB
+	DXOP	READ,13			;READ CHAR IN MSB
+	DXOP	MESG,14			;OUTPUT NULL TERMINATED MESSAGE
+	DXOP	DEBUG,15
+;
+; OPERATING SYSTEM EQUATES
+;
+SHELL:		EQU	0D000H
+BDOS:		EQU	0E400H
+MONITOR:	EQU	0F000H
+BANNER:		EQU	MONITOR + 4
+
+MAP_WIN_BASE:	 EQU	080C0H		;6116 MAP REGISTER CRU BASE
+NUM_MAP_ENTRIES: EQU	16		;16 PAGE REGISTERS
+
+;
+; WORKSPACE AND MEMORY LAYOUT
+;
+WORKSP:		EQU	0230H		;SHELL WORKSPACE
+STACKP:		EQU	1000H			;STACK AT 0x1000, GROWS DOWN
+TPA:		EQU	0500H
+CMDLINE:	EQU	0250H
+HALT:		EQU	10FFH
+COMM_BUF:	EQU	0300H		;COMMON BUFFER / LOADERCODE AREA
+COMM_FCB:	EQU	0280H
+FCB:		EQU	COMM_FCB
+;
+; SHELL ENTRY POINT
+;
+	;*******************************************************************
+	;  BDOS SWAP XOP 0 - Lives in COMMON (0x0100-0x013F)
+	;
+	;  Installed by SHELL INIT into XOP 0 vector at 0x0040.
+	;  Called from cbdos.a99 via DXOP BDOS_CALL,0
+	;
+	;  XOP mechanism:
+	;    - Saves caller WP->R13, PC->R14, ST->R15 in THIS workspace
+	;    - Switches to BDOS_XWP workspace
+	;    - Disables PSEL automatically
+	;    - RTWP restores caller context
+	;
+	;  Handler reads caller R2/R3 via @(R13), writes result to caller R1
+	;*******************************************************************
+	AORG	BDOS_XWP			;0x0100 - XOP 0 WORKSPACE
+		BSS	32			;16 WORDS FOR XOP 0 WORKSPACE
+
+	AORG	BDOS_XOP_E			;0x0120 - XOP 0 HANDLER
+		WHEX	R13			;DEBUG - CALLER WP
+		WHEX	R14			;DEBUG - CALLER PC
+	;--- READ CALLER R2 (FUNCTION) AND R3 (PARAM) ---
+		MOV	@4(R13),R2		;CALLER R2 = BDOS FUNCTION CODE
+		MOV	@6(R13),R3		;CALLER R3 = BDOS PARAMETER
+	;--- SAVE CURRENT SEGMENT 13 PAGE MAPPING ---
+		LI	R12,BDOS_CRU		;CRU ADDR FOR SEGMENT 13
+		CLR	R1
+		STCR	R1,BYTEWIDE		;READ CURRENT PAGE INTO R1
+		MOV	R1,R8			;SAVE IN R8 (OWN WORKSPACE)
+	;--- MAP BDOS PAGE INTO SEGMENT 13 ---
+		LI	R1,BDOS_PAGE
+		;LDCR writes from LSB - page number used directly
+		LDCR	R1,BYTEWIDE		;PROGRAM SEGMENT 13 = BDOS PAGE
+	;--- ENABLE PSEL ---
+		LI	R9,PSEL_EN
+		PSEL	R9
+	;--- CALL BDOS ---
+		CALL	@BDOS_VIRT		;CALL INTO 0xD000
+	;--- SAVE BDOS RESULT BEFORE RESTORING MAPPER ---
+		MOV	R1,R7			;SAVE BDOS RESULT IN R7
+	;--- DISABLE PSEL TO SAFELY REPROGRAM MAPPER ---
+		CLR	R9
+		PSEL	R9
+	;--- RESTORE PREVIOUS SEGMENT 13 MAPPING ---
+		MOV	R8,R1			;SAVED PAGE (ALREADY IN HIGH BYTE FROM STCR)
+		LI	R12,BDOS_CRU
+		LDCR	R1,BYTEWIDE		;RESTORE SEGMENT 13 (HIGH BYTE = PAGE)
+	;--- RE-ENABLE PSEL ---
+		LI	R9,PSEL_EN
+		PSEL	R9
+	;--- PUT BDOS RETURN VALUE INTO CALLER R1 ---
+		MOV	R7,@2(R13)		;R1 OF CALLER WORKSPACE = BDOS RESULT
+	;--- RETURN FROM XOP ---
+		RTWP
+
+	AORG	SHELL
+	LWPI	WORKSP
+	LI	SP,STACKP
+	BL	@MAP_INIT		;CLEAR ALL MAP REGISTERS TO PAGE 0
+	B	@INIT
+;
+; LOW MEMORY EQUATES
+;
+CMDL_PTR:	EQU	0A0H
+CMDL_SIZE:	EQU	0A2H
+BUFF_PTR:	EQU	0A4H
+LBA:		EQU	0A8H
+FCB_PTR:	EQU	0ACH
+FREEMEM:	EQU	0A6H
+MEMLIMIT:	EQU	0B0H
+BUFFSIZ:	EQU	512
+;
+SHELL_PTR:	EQU	80H
+BDOS_PTR:	EQU	84H
+LOADER:		EQU	0300H
+CLSZ:		EQU	64
+BYTSEC:		EQU	512
+BYTEWIDE:	EQU	2			;CRU BITS PER MAP REGISTER
+NUM_SEGS:	EQU	16			;NUMBER OF MAP SEGMENTS
+PROT_SEG:	EQU	12			;FIRST PROTECTED SEGMENT
+SEG_SIZE:	EQU	1000H			;4KB SEGMENT SIZE
+PSEL_EN:	EQU	0100H			;PSEL ENABLE VALUE
+INT2_VEC:	EQU	000AH			;INT2 VECTOR ADDRESS
+BDOS_PAGE:	EQU	14			;PHYSICAL PAGE WHERE BDOS LIVES
+BDOS_SEG:	EQU	14			;VIRTUAL SEGMENT FOR BDOS (0xE000)
+BDOS_VIRT:	EQU	0E000H			;BDOS VIRTUAL ADDRESS (UNCHANGED)
+BDOS_CRU:	EQU	MAP_WIN_BASE+(BDOS_SEG*2)	;CRU ADDR FOR SEG 14 = 0x80DC
+XOP0_WP:	EQU	0040H			;XOP 0 VECTOR - WORKSPACE PTR
+XOP0_PC:	EQU	0042H			;XOP 0 VECTOR - HANDLER PC
+BDOS_XWP:	EQU	0100H			;BDOS XOP WORKSPACE (32 BYTES)
+BDOS_XOP_E:	EQU	0120H			;BDOS XOP HANDLER ENTRY
+STAGING:	EQU	0500H			;SECTOR STAGING BUFFER
+OVL_PRINT_VEC:	EQU	02A0H			;OVERLAY PRINT CALLBACK VECTOR (PAGE VARIABLES AREA)
+FLATBASE:	EQU	1000H			;DEFAULT FLAT LOAD ADDRESS
+
+IDE_BYTSEC:	EQU	256
+
+;
+; BDOS FUNCTION CODES
+;
+CIN	EQU	1
+COUT	EQU	2
+SELDSK	EQU	14
+RDSEQ	EQU	20
+FOPEN	EQU	15
+FCLOSE	EQU	16
+SEARCH1	EQU	17
+SEARCH2	EQU	18
+ERAFIL	EQU	19
+WRSEQ	EQU	21
+MAKFIL	EQU	22
+SETDMA	EQU	26
+HDERR	EQU	0
+DOSERR	EQU	0
+;
+; FCB OFFSETS
+;
+NAM	EQU	0
+FTY	EQU	11
+FLA	EQU	16
+CRN	EQU	26
+CBN	EQU	24
+RELB	EQU	28
+RELR	EQU	30
+FSB	EQU	12
+FSZ	EQU	14
+;
+; FILE TYPES
+;
+COM	EQU	1
+EXE	EQU	2
+TXT	EQU	3
+BAS	EQU	4
+PRO	EQU	5
+;
+; ASSEMBLY CONSTANTS
+;
+BLKSIZ	EQU	512
+NAMSIZ	EQU	11
+EXTSIZ	EQU	3
+DDEN	EQU	1
+DCOMR	EQU	1
+PAD	EQU	0
+EXTOFF	EQU	NAMSIZ-EXTSIZ
+CTLC	BYTE	03H
+CTLX	BYTE	18H
+CTLS	BYTE	13H
+CTLY	BYTE	19H
+CTLZ	BYTE	1AH
+SPACE	BYTE	20H
+	BYTE	0
+BS	BYTE	08H
+CR	BYTE	0DH
+LF	BYTE	0AH
+DEL	BYTE	07H
+EOF	BYTE	0FFH
+COMT	BYTE	3AH
+JUMP	BYTE	'.'
+NULPARM	BYTE	'.'
+EXT	BYTE	'.'
+NOTE	BYTE	'_'
+PROM	BYTE	'%'
+SUBMARK	BYTE	'$'
+SYSFILE	BYTE	'*'
+DOSCMD	BYTE	'+'
+CONSOLE	EQU	0
+EXEC	EQU	2
+PROC	EQU	5
+DEFDRV	EQU	0
+	EVEN
+
+;*******************************************************************
+;	INIT - cold start initialisation
+;*******************************************************************
+	EVEN
+INIT	LWPI	WORKSP
+	LI	SP,STACKP
+
+	;--- INIT 7 INTERRUPT VECTORS TO SAFE RTWP HANDLER ---
+	LI	R0,WORKSP		;WP FOR INTERRUPT HANDLER
+	LI	R1,INT_SAFE		;PC = SAFE RTWP HANDLER
+	LI	R2,00B0H		;FIRST INTERRUPT VECTOR
+	LI	R3,7			;7 VECTORS
+INIT_IV	MOV	R0,*R2+			;STORE WP
+	MOV	R1,*R2+			;STORE PC
+	DEC	R3
+	JNE	INIT_IV
+
+	LI	R1,CMDLINE
+	LI	R2,CMDLINE2
+CMDLOOP:	MOVB	*R2+,*R1+
+	JNE	CMDLOOP
+
+	MOVB	@CR,@CMDLINE
+	LI	R0,CMDLINE
+	MOV	R0,@CMDL_PTR
+	CLR	@CMDL_SIZE
+	LI	R0,COMM_BUF
+	MOV	R0,@BUFF_PTR
+	LI	R0,COMM_FCB
+	MOV	R0,@FCB_PTR
+
+INIT22	LI	R0,0460H
+	LI	R1,RETURN
+	MOV	R0,@SHELL_PTR
+	MOV	R1,@SHELL_PTR+2
+
+	LI	R0,0460H
+	LI	R1,BDOS
+	MOV	R0,@BDOS_PTR
+	MOV	R1,@BDOS_PTR+2
+
+	;--- INSTALL BDOS SWAP XOP 0 AT 0x0040 ---
+	LI	R0,BDOS_XWP			;WORKSPACE ADDRESS IN COMMON
+	MOV	R0,@XOP0_WP			;XOP 0 WORKSPACE POINTER
+	LI	R0,BDOS_XOP_E			;HANDLER ADDRESS IN COMMON
+	MOV	R0,@XOP0_PC			;XOP 0 PC POINTER
+
+	LI	R0,TPA
+	MOV	R0,@FREEMEM
+	LI	R0,SHELL
+	MOV	R0,@MEMLIMIT
+
+	MESG	@SINON
+
+;*******************************************************************
+;	DOCMD - process next shell command
+;*******************************************************************
+DOCMD	MOV	@SKIPSW,R0
+	CLR	@SKIPSW
+	MOV	R0,R0
+	JNE	DOCMD2A
+	LI	R3,CMDLINE
+	CLR	R1
+	MOVB	*R3,R1
+	CB	R1,@CR
+	JEQ	DOCMD2A
+
+CHKSYS	CI	R1,0
+	JNE	DOCMD1
+	B	@CMDERR
+
+DOCMD1	CB	R1,@CTLX
+	JNE	DOCMDAA
+	BLWP	@BANNER
+DOCMDAA	CB	R1,@CTLY
+	JNE	DOCMD2
+
+DOCMD2	CB	R1,@SPACE
+	JH	DOCMD4
+
+DOCMD2A	B	@NEXTCMD
+
+DOCMD4	CB	R1,@JUMP
+	JNE	DOCMD3
+	LI	R3,CMDLINE+1
+	CB	*R3,@SPACE
+	JH	LOOK
+	B	@GOPROG
+
+DOCMD3	CB	R1,@DOSCMD
+	JNE	LOOK
+DOCMD9	B	@RETURN
+
+;*******************************************************************
+;	LOOK - look up named file
+;*******************************************************************
+LOOK:	CALL	@PARSENAME
+	CALL	@ICMD
+	CALL	@SEG_SWITCH
+
+	CB	@FCB+EXTOFF,@SPACE
+	JNE	L_START
+
+	LI	R0,EXT_TAB
+L_TRY:	MOVB	*R0+,@FCB+EXTOFF
+	MOVB	*R0+,@FCB+EXTOFF + 1
+	MOVB	*R0+,@FCB+EXTOFF + 2
+
+L_START:	LI	R3,FCB
+	LI	R2,SEARCH1
+	CALL	@BDOS
+	MOV	R1,R1
+	JHE	L_FOUND
+
+	CB	@FCB+EXTOFF,@SPACE
+	CI	R0,EXT_END
+	JL	L_TRY
+
+LOOKERR:	B	@CMDERR
+
+L_FOUND:	LI	R2,FOPEN
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	R1,R1
+	JLT	LOOKERR
+	LI	R4,FCB
+	MOV	@FSZ(R4),@MFSZ
+	MOVB	@FTY(R4),@MFTY
+	B	@LOAD
+
+;*******************************************************************
+;	PADSPACE - R2=count, R4=destination
+;*******************************************************************
+PADSPACE:	MOV	R2,R2
+	JLE	PADRETS
+PADLOOP:	MOVB	@SPACE,*R4+
+	DEC	R2
+	JH	PADLOOP
+PADRETS:	RET
+
+;*******************************************************************
+;	CHKCHAR - check if char at *R3 is valid filename char
+;*******************************************************************
+CHKCHAR:	MOVB	*R3,R1
+	SRL	R1,8
+	CI	R1,'0'
+	JL	INVALID
+	CI	R1,'9'
+	JLE	VALID
+	ANDI	R1,00DFH
+	AI	R1,-'A'
+	CI	R1,001AH
+	JH	INVALID
+VALID:	CLR	R1
+	JMP	SETFLAG
+INVALID:	LI	R1,1
+SETFLAG:	MOV	R1,R1
+	RET
+
+;*******************************************************************
+;	SEG_SWITCH - deprecated v5.4 (transparent GAL mapping)
+;*******************************************************************
+SEG_SWITCH:	RET
+
+SSWERR:	B	@PARSERR
+
+;*******************************************************************
+;	PARSENAME - parse filename from command line into FCB
+;*******************************************************************
+PARSENAME:	LI	R4,FCB
+	LI	R2,NAMSIZ - EXTSIZ
+	CLR	R0
+
+PARSE1:	CALL	@CHKCHAR
+	JNE	FILLNAME
+	MOVB	*R3+,*R4+
+	DEC	R2
+	JEQ	FINDDOT
+	JMP	PARSE1
+
+FILLNAME:	CALL	@PADSPACE
+
+FINDDOT:	CB	*R3+,@EXT
+	JEQ	GETEXT
+	DEC	R3
+	LI	R2,EXTSIZ
+	LI	R4,FCB + NAMSIZ - EXTSIZ
+	CALL	@PADSPACE
+	RET
+
+EXT_TAB:	TEXT	'COMBASBAT'
+CHRT:	BYTE	'T'
+CHRM:	BYTE	'M'
+CHRS:	BYTE	'S'
+EXT_END:	BYTE	0
+	EVEN
+
+GETEXT:	LI	R2,EXTSIZ
+	LI	R4,FCB + NAMSIZ - EXTSIZ
+NEXTEXT:	CALL	@CHKCHAR
+	JNE	FILLEXT
+	MOVB	*R3+,R1
+	ANDI	R1,0DF00H
+	MOVB	R1,*R4+
+	DEC	R2
+	JEQ	FILLEXT
+	JMP	NEXTEXT
+FILLEXT:	CALL	@PADSPACE
+	RET
+
+;*******************************************************************
+;	LOAD - load executable file
+;
+;	FLA in FCB gives load address (0 = use TPA).
+;	'.' prefix = flat load only, no execution, returns to prompt.
+;	COM/EXE/type 0 = LOADERCODE (handles paged and raw binaries).
+;*******************************************************************
+LOAD:	CLR	R1
+	MOVB	R1,@CMDLINE-2
+	LI	R4,FCB
+	MOV	@FLA(R4),R3
+	JNE	LOAD2
+	LI	R3,TPA
+LOAD2	MOV	R3,@LADDR
+	CLR	@CRN(R4)
+
+	CB	@CMDLINE,@JUMP
+	JNE	LOADRUN
+LOADF3	DECT	SP
+	MOV	R3,*SP
+LOADF0	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R3
+	CI	R1,-1
+	JEQ	LOADF1
+	AI	R3,BLKSIZ
+	JMP	LOADF3
+LOADF1	MOV	R3,@FREEMEM
+	B	@NEXTCMD
+
+LOADRUN:
+	MOVB	@MFTY,R1
+	SRL	R1,8
+	CI	R1,COM
+	JNE	LT2
+	B	@GOPROG
+LT2	CI	R1,EXE
+	JNE	LT3
+	B	@GOPROG
+LT3	CI	R1,0
+	JNE	LT4
+	B	@GOPROG
+LT4
+	CLR	@CRN(R4)
+LOAD3	DECT	SP
+	MOV	R3,*SP
+LOAD0	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R3
+	CI	R1,-1
+	JEQ	LOAD1
+	AI	R3,BLKSIZ
+	JMP	LOAD3
+LOAD1	MOV	R3,@FREEMEM
+	MOVB	@MFTY,R1
+	SRL	R1,8
+	CI	R1,PROC
+	JNE	LOAD1B
+	B	@NEXTCMD
+LOAD1B	CI	R1,TXT
+	JNE	LOAD1C
+	B	@NEXTCMD
+LOAD1C	B	@NEXTCMD
+
+;*******************************************************************
+;	GOPROG - run loaded program via LOADERCODE
+;*******************************************************************
+GOPROG	LI	R4,CMDLINE
+GOLOOP	INC	R4
+	CB	*R4,@SPACE
+	JH	GOLOOP
+	CLR	R1
+	MOVB	R1,@CMDLINE-1
+	LI	R0,SHELL_PTR
+	DECT	SP
+	MOV	R0,*SP
+	CALL	@INIT_LOADER
+	B	@LOADER
+
+;*******************************************************************
+;	INIT_LOADER - copy LOADERCODE to LOADER (0x0300)
+;*******************************************************************
+INIT_LOADER:	LI	R2,LOADER
+	LI	R1,LOADERCODE
+IL0:	MOV	*R1+,*R2+
+	CI	R1,END_LOADER
+	JL	IL0
+	RET
+
+;*******************************************************************
+;  LOADERCODE v5.6
+;
+;  Copied to LOADER (0x0300) by INIT_LOADER, runs from COMMON.
+;
+;  STAGING buffer: 0x0500, 512 bytes, always in common memory.
+;  First sector always read to STAGING for format detection.
+;  LADDR: FCB load address - used only for raw binary.
+;
+;  File format detection (first word of staging buffer):
+;    FFFF = link99 format:
+;           FFFF FFFF FFFF   opening sentinel
+;           start end page   pagemap entry (one entry for now)
+;           FFFF FFFF FFFF   closing sentinel
+;           size data...     one block
+;    else = raw binary: load flat to LADDR, launch from LADDR
+;
+;  Paged load sequence:
+;    1. Clear all map registers to page 0
+;    2. Read first sector to STAGING
+;    3. Detect format
+;    4. Walk pagemap entries, call MAP_SET for each segment
+;    5. Enable PSEL once after all MAP_SET calls
+;    6. Copy block to destination (LDRCPY/LDRSEC)
+;    7. Launch from R8 (first pagemap entry start)
+;
+;  Key registers:
+;    R1   source in STAGING (reset each sector reload)
+;    R2   paged destination (walks continuously)
+;    R3   words remaining (saved/restored across BDOS via stack)
+;    R4   end of STAGING = 0x0700
+;    R6   walks STAGING: pagemap then block data
+;    R7   segment walker in LDRSEG
+;    R8   launch address (first pagemap entry start)
+;    R9   scratch / PSEL value
+;*******************************************************************
+
+LOADERCODE:
+
+;--- CLEAR ALL MAP REGISTERS TO PAGE 0 ---
+	LI	R12,MAP_WIN_BASE
+	CLR	R0
+	LI	R1,NUM_SEGS
+LDRCL:	LDCR	R0,BYTEWIDE
+	INCT	R12
+	DEC	R1
+	JNE	LDRCL
+
+;--- READ FIRST SECTOR TO STAGING (0x0500) ---
+	CLR	R0
+	LI	R3,0500H		;STAGING BUFFER
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	CI	R1,-1
+	JNE	LDRDET
+	B	@LDRRUN_F		;EMPTY FILE
+LDRDET:	MOV	R1,R1
+	JLT	LDRDET_ERR
+	JMP	LDRDET1
+LDRDET_ERR:
+	B	@LDRERR
+LDRDET1:
+
+;--- DETECT FORMAT ---
+;  First word FFFF = link99 format (opening sentinel)
+;  Anything else  = raw binary
+	LI	R6,0500H		;START OF STAGING
+	MOV	*R6,R0
+	CI	R0,0FFFFH
+	JNE	LDRDET2			;NOT FFFF = RAW BINARY
+	JMP	LDRPM
+LDRDET2:	B	@LDRRAW
+
+;--- WALK PAGEMAP ---
+;  R6 points at current sentinel on first entry and after each entry
+;  LDRPM:  skip sentinel then peek at next word
+;  LDRPM1: re-entry point after processing an entry (R6 at next sentinel)
+LDRPM:	AI	R6,6			;SKIP SENTINEL - R6 NOW AT ENTRY OR CLOSING SENTINEL
+LDRPM1:	MOV	*R6,R0
+	CI	R0,0FFFFH
+	JEQ	LDRSENT			;CLOSING SENTINEL = END OF PAGEMAP
+	MOV	*R6+,R7			;R7 = START ADDRESS
+	MOV	R7,R8			;R8 = LAUNCH ADDRESS (FIRST ENTRY)
+	MOV	*R6+,R1			;R1 = END ADDRESS
+	MOV	*R6+,R4			;R4 = PAGE NUMBER
+	MOV	R4,R0
+	JEQ	LDRPM1			;PAGE 0 = FLAT - SKIP MAP_SET - R6 AT NEXT SENTINEL
+
+LDRSEG:	MOV	R7,R0
+	SRL	R0,12			;SEGMENT = ADDR >> 12
+	CI	R0,PROT_SEG
+	JHE	LDRPROT
+	MOV	R0,R9			;R9 = SEGMENT
+	MOV	R4,R0			;R0 = PAGE
+	BL	@MAP_SET
+LDRPROT:
+	AI	R7,SEG_SIZE
+	C	R7,R1
+	JL	LDRSEG
+	JMP	LDRPM1			;NEXT ENTRY - R6 ALREADY AT NEXT SENTINEL
+
+;--- CLOSING SENTINEL: ENABLE PSEL, SET UP COPY ---
+LDRSENT:
+	AI	R6,6			;SKIP CLOSING SENTINEL
+	MOV	R8,R2			;R2 = COPY DESTINATION
+	LI	R9,PSEL_EN
+	PSEL	R9			;ENABLE PSEL ONCE
+
+;--- READ BLOCK SIZE AND SET UP WORD COUNT ---
+LDRBLK:	MOV	*R6,R5
+	CI	R5,0FFFFH
+	JEQ	LDRRUN
+	CI	R5,0
+	JEQ	LDRRUN
+	INCT	R6			;SKIP SIZE WORD
+	MOV	R6,R1			;R1 = SOURCE
+	SRL	R5,1			;BYTES TO WORDS
+	MOV	R5,R3			;R3 = WORD COUNT
+	LI	R4,0700H		;R4 = END OF STAGING
+
+;--- COPY WORDS: STAGING -> PAGED MEMORY (PSEL ACTIVE) ---
+LDRCPY:	MOV	*R1+,*R2+
+	DEC	R3
+	JEQ	LDRRUN			;ALL WORDS DONE
+	C	R1,R4
+	JL	LDRCPY			;MORE IN STAGING
+
+;--- STAGING EXHAUSTED: RELOAD NEXT SECTOR TO STAGING ---
+;  Stack saves are safe - BDOS uses own workspace via CALL XOP
+LDRSEC:	DECT	SP
+	MOV	R8,*SP			;SAVE LAUNCH ADDRESS
+	DECT	SP
+	MOV	R2,*SP			;SAVE PAGED DESTINATION
+	DECT	SP
+	MOV	R3,*SP			;SAVE WORD COUNT
+	LI	R3,0500H		;DMA TO STAGING
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R3			;RESTORE WORD COUNT
+	MOV	*SP+,R2			;RESTORE PAGED DESTINATION
+	MOV	*SP+,R8			;RESTORE LAUNCH ADDRESS
+	CI	R1,-1
+	JEQ	LDRRUN			;EOF - ALL DATA LOADED
+	LI	R9,PSEL_EN		;RE-ENABLE PSEL
+	PSEL	R9
+	LI	R1,0500H		;RESET SOURCE TO START OF STAGING
+	LI	R4,0700H		;RESET END OF STAGING
+	JMP	LDRCPY			;RESUME COPY
+
+;--- LAUNCH PAGED PROGRAM ---
+LDRRUN:	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
+	JNE	LDRRUN_LOAD		;YES - SKIP EXECUTE
+	LI	R0,INT2_HANDLER
+	MOV	R0,@INT2_VEC
+	CLR	R15
+	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
+	LST	R15
+	B	*R8
+LDRRUN_LOAD:
+	CLR	R9
+	PSEL	R9			;DISABLE PSEL
+	CLR	R0
+	MOV	R0,@LOAD_ONLY		;CLEAR FLAG
+	MESG	@TXT_LOADED		;CONFIRM LOAD
+	B	@NEXTCMD		;BACK TO SHELL PROMPT
+
+;--- RAW BINARY: LOAD TO LADDR, LAUNCH FROM LADDR ---
+LDRRAW:	MOV	@LADDR,R9		;R9 = LAUNCH ADDRESS
+	LI	R3,0500H		;COPY STAGING -> LADDR
+	MOV	@LADDR,R4
+LDRRAW1:MOV	*R3+,*R4+
+	CI	R3,0700H		;END OF STAGING
+	JL	LDRRAW1
+	MOV	@LADDR,R3
+	AI	R3,BYTSEC		;NEXT SECTOR
+
+LDRRAWS:DECT	SP
+	MOV	R3,*SP
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R3
+	CI	R1,-1
+	JNE	LDRRAWS1
+	B	@LDRRUN_F
+LDRRAWS1:
+	MOV	R1,R1
+	JLT	LDRRAWS_ERR
+	AI	R3,BYTSEC
+	JMP	LDRRAWS
+LDRRAWS_ERR:
+	B	@LDRERR
+
+;--- LAUNCH RAW/FLAT (NO PSEL) ---
+LDRRUN_F:
+	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
+	JNE	LDRRUN_LOAD		;YES - SKIP EXECUTE
+	LI	R0,INT2_HANDLER		;INSTALL INT2 DEBUG HANDLER
+	MOV	R0,@INT2_VEC
+	CLR	R15
+	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
+	LST	R15
+	MOV	R9,R2
+	B	*R2
+
+LDRERR:	MESG	@TXT_LDRERR
+	B	@RETURN
+
+TXT_LDRERR:	TEXT	'--Loader read error'
+		BYTE	0DH,0AH,0
+		EVEN
+TXT_LOADED:	TEXT	'Loaded'
+		BYTE	0DH,0AH,0
+		EVEN
+
+END_LOADER:	EQU	$+0
+;*******************************************************************
+;	RETURN - program exit
+;*******************************************************************
+RETURN:	BL	@MAP_INIT
+	MOVB	R1,@CMDLINE-2
+	LWPI	WORKSP
+	LI	SP,STACKP
+	CLR	R15
+	MOVB	@CMDLINE-2,R1
+	SRA	R1,8
+	CI	R1,-1
+	JNE	NEXTCMD
+	CLR	R1
+	MOVB	R1,@CMDLINE-2
+	MOV	R1,R1
+	JEQ	NEXTCMD
+	B	@UNPROC
+
+;*******************************************************************
+;	NEXTCMD / PROMPT
+;*******************************************************************
+NEXTCMD	MOVB	@PROCSW,R1
+	JEQ	PROMPT
+	B	@PFETCH
+
+PROMPT:	MOVB	@PROM,R3
+	CALL	@OUTCHAR
+	LI	R4,CMDLINE
+	LI	R5,CLSZ
+CINLOOP	MOV	@CONSOLE,R1
+	CALL	@INCHAR
+	CB	R1,@BS
+	JEQ	RUBOUT
+	CB	R1,@DEL
+	JEQ	RUBOUT
+	CB	R1,@CTLC
+	JNE	STOWIT
+	MOVB	@CR,R1
+	MOVB	R1,@CMDLINE
+
+STOWIT	MOV	R1,R0
+	SRL	R0,8
+	CI	R0,61H
+	JL	STOWIT2
+	CI	R0,7AH
+	JH	STOWIT2
+	AI	R0,-20H
+	SWPB	R0
+	MOVB	R0,*R4+
+	JMP	STOWIT2+2
+STOWIT2	MOVB	R1,*R4+
+	DEC	R5
+	JLE	CIOERR
+	CB	R1,@SPACE
+	JHE	ECHO
+	CLR	R0
+	MOVB	@CR,R1
+	MOVB	R0,*R4
+ECHO	MOV	R1,R3
+	CALL	@OUTCHAR
+	CLR	@SKIPSW
+	CB	R1,@LF
+	JEQ	GODOCMD
+	JMP	CINLOOP
+RUBOUT	CI	R5,CLSZ
+	JHE	CINLOOP
+	INC	R5
+	DEC	R4
+	DECT	SP
+	MOV	R4,*SP
+	LI	R4,RUBMSG
+	CALL	@OUTSTR
+	MOV	*SP+,R4
+	JMP	CINLOOP
+GODOCMD	LI	R0,CMDLINE
+	S	R0,R4
+	MOV	R4,@CMDL_SIZE
+	B	@DOCMD
+CIOERR	B	@LINERR
+
+;*******************************************************************
+;	INTERNAL COMMANDS
+;*******************************************************************
+CMDCNT	EQU	5
+ICLIST	TEXT	"DIR"
+	BYTE	0
+	WORD	DSKDIR
+	TEXT	"SAVE"
+	BYTE	0
+	WORD	DSKSAVE
+	TEXT	"ERA"
+	BYTE	0
+	WORD	ERAFILE
+	TEXT	"TYPE"
+	BYTE	0
+	WORD	TYPEFILE
+	TEXT	"LOAD"
+	BYTE	0
+	WORD	DOLOAD
+	EVEN
+
+BUFPNT	WORD	0
+RECCNT	WORD	0
+LOAD_ONLY:	WORD	0			;NON-ZERO = LOAD WITHOUT EXECUTE
+SADDR	WORD	0
+SWITCH	BYTE	'-'
+	EVEN
+
+ICMD	LI	R1,ICLIST
+	LI	R4,FCB
+	LI	R5,CMDCNT
+ICMD0	CB	*R4+,*R1+
+	JEQ	ICMD0
+	DEC	R1
+	DEC	R4
+	CB	*R4,@SPACE
+	JH	ICMD1
+	MOVB	*R1,R0
+	JNE	ICMD1
+	INC	R1
+	MOVB	*R1+,R2
+	SWPB	R2
+	MOVB	*R1+,R2
+	SWPB	R2
+	MOV	*SP+,R0
+	B	*R2
+ICMD1	DEC	R5
+	JEQ	ICMDE
+ICMD2	MOVB	*R1+,R0
+	JNE	ICMD2
+	INCT	R1
+	LI	R4,FCB
+	JMP	ICMD0
+ICMDE	RET
+
+;*******************************************************************
+;	DIR
+;*******************************************************************
+BAR	TEXT	' : '
+	BYTE	0
+CRLF	BYTE	0DH,0AH,0
+MNOFILE	TEXT	'NO FILES'
+	BYTE	0DH,0AH,0
+	EVEN
+CCOUNT	WORD	0
+	EVEN
+
+DSKDIR:	LI	R0,1
+	MOV	R0,@CCOUNT
+	LI	R1,'?'*256
+	LI	R0,NAMSIZ
+	LI	R8,FCB
+	MOV	R8,R2
+DSKDIR0	MOVB	R1,*R2+
+	DEC	R0
+	JNE	DSKDIR0
+	LI	R2,SEARCH1
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	R1,R1
+	JLT	NOFILE
+	CALL	@PNAME
+DSKDIR1	LI	R2,SEARCH2
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	R1,R1
+	JLT	DIREXIT
+	CALL	@PNAME
+	JMP	DSKDIR1
+
+PNAME	DEC	@CCOUNT
+	JNE	PNAME1
+	MESG	@CRLF
+	LI	R1,1
+	MOV	R1,@CCOUNT
+PNAME1	MOV	R3,R1
+	LI	R0,NAMSIZ
+PNAME2	DECT	SP
+	MOV	R0,*SP
+	MOVB	*R1+,R3
+	SWPB	R3
+	DECT	SP
+	MOV	R1,*SP
+	LI	R2,COUT
+	CALL	@BDOS
+	MOV	*SP+,R1
+	MOV	*SP+,R0
+	DEC	R0
+	JNE	PNAME2
+	MOV	@CCOUNT,R0
+	CI	R0,1
+	JEQ	PNAME3
+	MESG	@CRLF
+PNAME3	RET
+
+DIREXIT	MESG	@CRLF
+	CLR	R1
+	B	@RETURN
+NOFILE	MESG	@MNOFILE
+	CLR	R1
+	B	@CMDERR
+
+;*******************************************************************
+;	SAVE
+;*******************************************************************
+CMDPTR	EQU	0A0H
+PARSERR	B	@PARSMSG
+
+DSKSAVE:	CLR	@BUFPNT
+	CLR	@RECCNT
+	LI	R3,TPA
+	MOV	R3,@SADDR
+	LI	R3,CMDLINE
+START00	CB	*R3+,@SPACE
+	JH	START00
+	DEC	R3
+START02	CB	*R3,@CR
+	JEQ	PARSERR
+	CB	*R3+,@SPACE
+	JLE	START02
+	DEC	R3
+	MOV	R3,@BUFPNT
+	CALL	@ATOD
+	MOV	R1,R1
+	JEQ	PARSERR
+	MOV	R1,@RECCNT
+	MOV	@BUFPNT,R3
+PREPARSE	CB	*R3,@CR
+	JEQ	PARSERR
+	CB	*R3+,@SPACE
+	JLE	PREPARSE
+	DEC	R3
+	CALL	@PARSENAME
+NAM2	CB	*R3+,@SPACE
+	JEQ	NAM2
+	DEC	R3
+	CB	*R3,@CR
+	JEQ	NAMSRCH
+	CB	*R3+,@SWITCH
+	JNE	PARSERR
+	MOV	R3,@BUFPNT
+	CALL	@CATOH
+	MOV	R1,R1
+	JEQ	PARSERR
+	MOV	R1,@SADDR
+NAMSRCH	LI	R2,SEARCH1
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	R1,R1
+	JLT	NAM5
+NAM3	LI	R2,ERAFIL
+	LI	R3,FCB
+	CALL	@BDOS
+NAM5	LI	R2,MAKFIL
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	R1,R1
+	JHE	SKMK1
+	B	@MKERR
+SKMK1:
+	LI	R4,FCB
+	MOV	@SADDR,R3
+	MOV	R3,@FLA(R4)
+	CLR	@CRN(R4)
+WRDATA	DECT	SP
+	MOV	R3,*SP
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,WRSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R3
+	MOV	R1,R1
+	JHE	SKWR1
+	B	@WRITERR
+SKWR1:
+	C	R3,@MEMLIMIT
+	JL	SKLG1
+	B	@LARGERR
+SKLG1:
+	AI	R3,BYTSEC
+	DEC	@RECCNT
+	JNE	WRDATA
+WRDATAC	LI	R2,FCLOSE
+	LI	R3,FCB
+	CALL	@BDOS
+EXIT	CLR	R1
+	B	@RETURN
+
+;*******************************************************************
+;	ERASE
+;*******************************************************************
+ERAPERR	B	@PARSMSG
+
+ERAFILE	CLR	@RECCNT
+	CLR	@BUFPNT
+	LI	R3,TPA
+	MOV	R3,@SADDR
+	LI	R3,CMDLINE
+ERA0	CB	*R3+,@SPACE
+	JH	ERA0
+	DEC	R3
+ERA01	CB	*R3,@CR
+	JEQ	ERAPERR
+	CB	*R3+,@SPACE
+	JLE	ERA01
+	DEC	R3
+	CALL	@PARSENAME
+ERA4	LI	R2,SEARCH1
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	R1,R1
+	JLT	ERAE
+	LI	R2,ERAFIL
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	R1,R1
+	JHE	SKMK2
+	B	@MKERR2
+SKMK2:
+ERAE	CLR	R1
+	B	@RETURN
+
+;*******************************************************************
+;	Error handlers
+;*******************************************************************
+WRITERR	MESG	@ERRMSG4
+	JMP	MKERR2
+MKERR	B	@MONITOR
+	MESG	@ERRMSG3
+	JMP	MKERR2
+CLOSERR	MESG	@ERRMSG1
+	JMP	MKERR2
+PARSMSG	MESG	@ERRMSG2
+	B	@NEXTCMD
+LARGERR	MESG	@ERRMSG5
+	JMP	MKERR2
+MKERR2	LI	R2,FCLOSE
+	LI	R3,FCB
+	CALL	@BDOS
+	B	@RETURN
+
+;*******************************************************************
+;	TYPE
+;*******************************************************************
+;*******************************************************************
+;	LOAD - load overlay into paged memory without executing
+;
+;	Usage: LOAD filename
+;	Loads the COM file, programs mapper registers per pagemap,
+;	copies code to paged memory, returns to shell without executing.
+;*******************************************************************
+DOLOAD:
+	;--- SKIP 'LOAD', PARSE OVERLAY FILENAME ---
+	LI	R3,CMDLINE
+DLSK1	CB	*R3+,@SPACE		;SKIP COMMAND NAME
+	JH	DLSK1
+	DEC	R3
+DLSK2	CB	*R3,@CR			;END OF LINE?
+	JEQ	DLERR
+	CB	*R3+,@SPACE		;SKIP SPACES
+	JLE	DLSK2
+	DEC	R3
+	CALL	@PARSENAME		;FCB = OVERLAY NAME+EXT
+
+	;--- OPEN FILE ---
+	LI	R4,FCB
+	CLR	@CRN(R4)
+	LI	R2,FOPEN
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	R1,R1
+	JLT	DLERR
+
+	;--- READ FIRST SECTOR ---
+	LI	R3,STAGING
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	CI	R1,-1
+	JEQ	DLERR
+
+	;--- CHECK PAGEMAP HEADER ---
+	LI	R6,STAGING
+	MOV	*R6,R0
+	CI	R0,0FFFFH
+	JNE	DLERR
+	AI	R6,6			;SKIP OPENING SENTINEL
+
+	;--- WALK PAGEMAP ENTRIES ---
+DLPM	MOV	*R6,R0
+	CI	R0,0FFFFH
+	JEQ	DLSENT			;CLOSING SENTINEL
+	MOV	*R6+,R7			;START ADDRESS
+	MOV	*R6+,R1			;END (UNUSED)
+	MOV	*R6+,R4			;PAGE NUMBER
+	MOV	R4,R0
+	JEQ	DLPM			;PAGE 0 = SKIP
+	MOV	R7,R9
+	SRL	R9,12			;SEGMENT = ADDR>>12
+	MOV	R4,R0
+	BL	@MAP_SET
+	JMP	DLPM
+
+	;--- LOAD BLOCK ---
+DLSENT	AI	R6,6			;SKIP CLOSING SENTINEL
+	MOV	*R6+,R5			;BLOCK SIZE (BYTES)
+	SRL	R5,1			;TO WORDS
+	MOV	R7,R2			;DESTINATION
+	LI	R9,PSEL_EN
+	PSEL	R9			;ENABLE PSEL
+	MOV	R6,R1			;SOURCE IN STAGING
+	LI	R4,STAGING+512		;END OF STAGING
+DLCPY	MOV	*R1+,*R2+
+	DEC	R5
+	JEQ	DLDONE
+	C	R1,R4
+	JL	DLCPY
+
+	;--- NEXT SECTOR ---
+	DECT	SP
+	MOV	R2,*SP
+	DECT	SP
+	MOV	R5,*SP
+	CLR	R9
+	PSEL	R9			;DISABLE PSEL FOR BDOS
+	LI	R3,STAGING
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R5
+	MOV	*SP+,R2
+	CI	R1,-1
+	JEQ	DLDONE
+	LI	R9,PSEL_EN
+	PSEL	R9
+	LI	R1,STAGING
+	LI	R4,STAGING+512
+	JMP	DLCPY
+
+DLDONE	CLR	R9
+	PSEL	R9			;DISABLE PSEL
+	MESG	@DLTXT_OK
+	B	@NEXTCMD
+
+DLERR	MESG	@DLTXT_ERR
+	B	@NEXTCMD
+
+DLTXT_OK	TEXT	'Loaded'
+	BYTE	0DH,0AH,0
+	EVEN
+DLTXT_ERR	TEXT	'--Load error'
+	BYTE	0DH,0AH,0
+	EVEN
+
+TYPEFILE:	B	@RETURN
+
+
+;*******************************************************************
+;	ASCII conversion utilities
+;*******************************************************************
+ATOD	CLR	R3
+	LI	R8,10
+ATOD00	MOV	@BUFPNT,R0
+	MOVB	*R0,R2
+	SRL	R2,8
+	AI	R2,-'0'
+	JLT	ATOD03
+	CI	R2,10
+	JLT	ATOD04
+ATOD03	MOV	R3,R1
+	RET
+ATOD04	MOV	R2,R0
+	MOV	R3,R2
+	MPY	R8,R2
+	A	R0,R3
+	INC	@BUFPNT
+	JMP	ATOD00
+
+CATOH	CLR	R2
+LOOP	MOV	@BUFPNT,R0
+	CLR	R1
+	MOVB	*R0,R1
+	CI	R1,'0'*256
+	JL	NOTHEX
+	CI	R1,'9'*256
+	JLE	GOTONE
+	CI	R1,'A'*256
+	JL	NOTHEX
+	CI	R1,'F'*256
+	JH	NOTHEX
+	AI	R1,0900H
+GOTONE	SLA	R1,4
+	SRL	R1,12
+	SLA	R2,4
+	A	R1,R2
+	INC	@BUFPNT
+	JMP	LOOP
+NOTHEX	MOV	R2,R1
+	RET
+
+;*******************************************************************
+;	Error messages
+;*******************************************************************
+ERRMSG1	TEXT	'--Close error'
+	BYTE	0DH,0AH,0
+ERRMSG2	TEXT	'--Parse error'
+	BYTE	0DH,0AH,0
+ERRMSG3	TEXT	'--Make error'
+	BYTE	0DH,0AH,0
+ERRMSG4	TEXT	'--Write error'
+	BYTE	0DH,0AH,0
+ERRMSG5	TEXT	'--File too large error'
+	BYTE	0DH,0AH,0
+	EVEN
+
+;*******************************************************************
+;	PROCEDURE processing
+;*******************************************************************
+PFETCH	LI	R4,CLSZ
+	MOV	R4,@CMDBYTES
+	LI	R4,CMDLINE
+	MOV	R4,@CMDADDR
+	CLR	@SUBFLAG
+PLOOP	MOV	@MCNT,R4
+	JNE	BUFMOVE
+	MOV	@MFSZ,R4
+	JEQ	PROCERR1
+	LI	R3,DEFDRV
+	LI	R2,SELDSK
+	CALL	@BDOS
+	LI	R3,COMM_BUF
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R3,FCB
+	LI	R2,RDSEQ
+	CALL	@BDOS
+	MOV	R1,R1
+	JLT	PROCERR0
+	LI	R1,BLKSIZ
+	MOV	R1,@MCNT
+	LI	R4,COMM_BUF
+	MOV	R4,@MADDR
+	DEC	@MFSZ
+	JMP	BUFMOVE
+PROCERR0	B	@SHELLERR
+PROCERR1	B	@UNPROC
+
+BUFMOVE	MOV	@MADDR,R4
+	MOVB	*R4+,R1
+	MOV	R4,@MADDR
+	DEC	@MCNT
+	DECT	SP
+	MOV	R1,*SP
+	MOV	@SUBFLAG,R0
+	JNE	PARMSUB
+	MOV	*SP+,R1
+	CB	R1,@SUBMARK
+	JNE	BUFMOV2
+	SETO	@SUBFLAG
+	JMP	PLOOP
+BUFMOV2	CB	R1,@EOF
+	JEQ	BUFMOV4
+	CB	R1,@PAD
+	JEQ	BUFMOV4
+BUFMOV3	CB	R1,@LF
+	JEQ	PLOOP
+BUFPUT	MOV	@CMDADDR,R4
+	MOVB	R1,*R4
+	CB	R1,@CR
+	JEQ	PEOL
+	INC	R4
+	MOV	R4,@CMDADDR
+	DEC	@CMDBYTES
+	JEQ	MOVERR
+	JMP	PLOOP
+BUFMOV4	B	@UNPROC
+MOVERR	B	@LINERR
+
+PARMSUB	CLR	@SUBFLAG
+	MOV	*SP+,R1
+	DECT	SP
+	MOV	R1,*SP
+	SRL	R1,8
+	AI	R1,0FFE0H
+	JLT	NOSUB
+	CI	R1,10
+	JGT	NOSUB
+	MOV	R1,R2
+	MOV	*SP+,R1
+	LI	R4,PPTRS
+SUBLOOP	MOV	*R4,R3
+	JEQ	NULLPARM
+	DEC	R2
+	JGT	SUBLOOP
+SUBLOOP2	MOVB	*R3,R1
+	CB	@SPACE,R1
+	JLT	PLOOP
+	INC	R3
+	MOV	@CMDADDR,R4
+	MOVB	R1,*R4+
+	MOV	R4,@CMDADDR
+	DEC	@CMDBYTES
+	JEQ	LINERR
+	JMP	SUBLOOP2
+NOSUB	MOV	*SP+,R1
+	JMP	BUFMOV2
+NULLPARM	LI	R1,0A00H
+	JMP	BUFMOV3
+
+PEOL	MOVB	@CMDLINE,R1
+	CB	@COMT,R1
+	JEQ	BPFETCH
+	CB	@NOTE,R1
+	JEQ	VIEW
+	MOV	@VSW,R1
+	JEQ	CKNSW
+VIEW	LI	R4,CMDLINE
+	CALL	@OUTSTR
+CKNSW	MOV	@NSW,R1
+	JNE	BPFETCH
+	MOVB	@CMDLINE,R1
+	CB	@NOTE,R1
+	JNE	BTDOCMD
+	LI	R4,CMDLINE
+	INC	R4
+	CB	*R4,@NOTE
+	JNE	BPFETCH
+WAIT	LI	R4,WAITMSG
+	CALL	@OUTSTR
+	CLR	R1
+	CALL	@CIN
+	DECT	SP
+	MOV	R1,*SP
+	MOVB	@CR,R3
+	CALL	@OUTCHAR
+	MOV	*SP+,R1
+	CB	R1,@CR
+	JEQ	BPFETCH
+	CB	R1,@CTLC
+	JEQ	UNPROC
+	CB	R1,@CTLS
+	JNE	WAIT
+	SETO	@SKIPSW
+BPFETCH	B	@PFETCH
+BTDOCMD	B	@DOCMD
+
+;*******************************************************************
+;	Error output
+;*******************************************************************
+CMDERR	LI	R4,CMDLINE
+	JMP	ERROUT
+LINERR	MOV	@CR,R2
+	LI	R4,LINEMSG
+	JMP	ERROUT
+PARMERR	LI	R4,PARMSG
+	JMP	ERROUT
+SHELLERR	LI	R4,SHELLMSG
+	JMP	ERROUT
+HARDERR	LI	R4,HARDMSG
+	JMP	ERROUT
+NULLERR	LI	R4,NULLMSG
+	JMP	ERROUT
+NESTERR	LI	R4,NESTMSG
+	JMP	ERROUT
+ERROUT:
+	MESG	@QUESTMSG
+	MESG	*R4
+	MESG	@CRLF
+
+UNPROC	CLR	@PROCSW
+	LI	R4,CHKSYS
+	INCT	R4
+	MOVB	@SYSFILE,*R4
+	B	@RETURN
+
+DOPROC	MOV	@PROCSW,R1
+	JNE	NESTERR
+	SETO	R1
+	MOV	R1,@PROCSW
+	LI	R3,FCB
+	LI	R4,MNAM
+	LI	R2,16
+	CALL	@BMOVE
+	CLR	R4
+	MOV	R4,@MCNT
+	CLR	@VSW
+	CLR	@NSW
+	LI	R4,PPTRS
+	MOV	R4,@PPADDR
+	LI	R3,PBUF
+	LI	R4,CMDLINE
+	LI	R2,10
+	CLR	R0
+PARSLOOP	CLR	R1
+	MOVB	*R4+,R1
+	CI	R1,2D00H
+	JNE	PARS1
+	MOV	R0,R0
+	JNE	PARS0B
+	INC	R4
+	MOVB	*R4,R1
+	DEC	R4
+	CI	R1,2000H
+	JH	PARS0B
+	MOVB	*R4,R1
+	CI	R1,5600H
+	JNE	PARS0A
+	MOV	R1,@VSW
+PARS0	INC	R4
+	JMP	PARSLOOP
+PARS0A	CI	R1,4E00H
+	JNE	PARS0B
+	LI	R1,2D00H
+	MOV	R1,@NSW
+	JMP	PARS0
+PARS0B	LI	R1,2D00H
+PARS1	MOVB	R1,*R3+
+	CI	R1,0D00H
+	JEQ	PARSEND
+	CI	R1,2000H
+	JH	PARS2
+	MOV	R0,R0
+	JEQ	PARSLOOP
+	CLR	R0
+	JMP	PARSLOOP
+PARS2	MOV	R0,R0
+	JNE	PARSLOOP
+	SETO	R0
+	DEC	R2
+	JLT	PARMERR
+	DECT	SP
+	MOV	R4,*SP
+	DECT	SP
+	MOV	R3,*SP
+	DEC	R3
+	MOVB	*R4,R1
+	CI	R1,2000H
+	JGT	PARS3
+	CB	*R3,@NULPARM
+	JNE	PARS3
+	LI	R1,2000H
+	MOVB	R1,*R3
+PARS3	MOV	@PPADDR,R4
+	MOV	R3,*R4+
+	MOV	R4,@PPADDR
+	MOV	*SP+,R3
+	MOV	*SP+,R4
+	JMP	PARSLOOP
+PARSEND	CLR	@PPADDR
+	B	@PFETCH
+
+BMOVE	MOVB	*R3+,*R4+
+	DEC	R2
+	JNE	BMOVE
+	RET
+
+;*******************************************************************
+;	Console I/O
+;*******************************************************************
+INCHAR	LI	R2,CIN
+	CALL	@BDOS
+	SWPB	R1
+	RET
+
+OUTCHAR	DECT	SP
+	MOV	R3,*SP
+	SWPB	R3
+	LI	R2,COUT
+	CALL	@BDOS
+	MOV	*SP+,R3
+	CB	R3,@CR
+	JNE	OUT0
+	MOVB	@LF,R3
+	SWPB	R3
+	LI	R2,COUT
+	CALL	@BDOS
+	LI	R3,0D0AH
+OUT0	RET
+
+OUTSTR	MOVB	*R4,R3
+	JEQ	STR0
+	INC	R4
+	CALL	@OUTCHAR
+	JMP	OUTSTR
+STR0	RET
+
+;*******************************************************************
+;	Variables
+;*******************************************************************
+CMDADDR		WORD	0
+CMDBYTES	WORD	0
+DOSV		WORD	0
+HDERRV		WORD	0
+DOSERRV		WORD	0
+PROCSW		WORD	0
+SKIPSW		WORD	0
+VSW		WORD	0
+NSW		WORD	0
+SUBFLAG		WORD	0
+LADDR		WORD	0
+
+VMENTRY		WORD	0
+CMDLINE2	BYTE	0DH,00
+		EVEN
+		BSS	CLSZ
+		EVEN
+
+		EVEN
+MNAM		BSS	NAMSIZ
+		EVEN
+		BSS	2
+		EVEN
+MFTY		WORD	0
+MFSZ		WORD	0
+		BSS	8
+MCNT		WORD	0
+MADDR		WORD	0
+
+;*******************************************************************
+;	Messages
+;*******************************************************************
+SINON	BYTE	0DH,0AH
+	TEXT	'Shell Version 5.6'
+	BYTE	0DH,0AH
+	TEXT	'TMS99105 SBC V4 - Paged Memory'
+	BYTE	0DH,0AH
+NULLMSG	BYTE	0
+	EVEN
+
+QUESTMSG	TEXT	"?"
+		BYTE	0
+		EVEN
+NESTMSG		TEXT	"Program name expected:"
+		BYTE	0DH,00
+		EVEN
+SHELLMSG	TEXT	"Shell error:"
+		BYTE	0DH,00H
+		EVEN
+RUBMSG		BYTE	08H,20H,08H,0
+		EVEN
+PARMSG		TEXT	"Too many parameters:"
+		BYTE	0DH,00
+		EVEN
+LINEMSG		TEXT	"Line too long:"
+		BYTE	0DH,00
+		EVEN
+HARDMSG		TEXT	"Hard disc error"
+		BYTE	0DH,00
+		EVEN
+WAITMSG		TEXT	"--waiting..."
+		BYTE	0
+		EVEN
+
+;*******************************************************************
+;	INT_SAFE - Safe interrupt handler for uninitialized vectors
+INT_SAFE:	RTWP
+
+;	INT2_HANDLER - Paged execution crash debug
+;
+;	Fires when an exception occurs in paged code.
+;	Prints PC, WP, ST at point of exception, then dumps
+;	all 16 map registers, then returns to monitor.
+;*******************************************************************
+INT2_HANDLER:
+	MESG	@TXT_INT2PC
+	WHEX	R14			;PC AT EXCEPTION
+	MESG	@TXT_INT2WP
+	WHEX	R13			;WORKSPACE POINTER
+	MESG	@TXT_INT2ST
+	WHEX	R15			;STATUS REGISTER
+	MESG	@TXT_INT2NL
+	CLR	R9
+	PSEL	R9			;DISABLE PSEL BEFORE READING MAP REGISTERS
+	MESG	@TXT_INT2MAP
+	LI	R12,MAP_WIN_BASE
+	CLR	R8
+INT2_ML:
+	CLR	R1
+	STCR	R1,BYTEWIDE
+	SRL	R1,14
+	WHEX	R1
+	LI	R0,2000H
+	WRITE	R0
+	INCT	R12
+	INC	R8
+	CI	R8,16
+	JL	INT2_ML
+	MESG	@TXT_INT2NL
+	B	@0F004H
+
+TXT_INT2PC:	TEXT	'INT2 PC:'
+		BYTE	0
+		EVEN
+TXT_INT2WP:	TEXT	' WP:'
+		BYTE	0
+		EVEN
+TXT_INT2ST:	TEXT	' ST:'
+		BYTE	0
+		EVEN
+TXT_INT2MAP:	TEXT	'MAP:'
+		BYTE	0
+		EVEN
+TXT_INT2NL:	BYTE	0DH,0AH,0
+		EVEN
+
+;*******************************************************************
+;	MAP_INIT - clear all 16 map registers to page 0
+;	Entry: none  Exit: R0=0, R1=0, R12=MAP_WIN_BASE+32
+;	Called at shell cold start and LOADERCODE entry.
+;*******************************************************************
+MAP_INIT:	CLR	R15
+	LST	R15
+	LI	R12,MAP_WIN_BASE
+	CLR	R0
+	LI	R1,NUM_MAP_ENTRIES
+MAPI_L:	LDCR	R0,BYTEWIDE
+	INCT	R12
+	DEC	R1
+	JNE	MAPI_L
+	RT
+
+;*******************************************************************
+;	MAP_SET - program one 6116 map register
+;	Entry: R9=segment (0-15), R0=page (0-3)
+;	Exit:  R9 clobbered (segment*2), R0 clobbered, R12=CRU addr
+;	Note:  R8 is safe - use R8 to preserve values across MAP_SET
+;*******************************************************************
+MAP_SET:
+	LI	R12,MAP_WIN_BASE
+	SLA	R9,1			;SEGMENT * 2 = CRU BIT OFFSET
+	A	R9,R12
+	SLA	R0,8			;MOVE PAGE TO HIGH BYTE (LDCR BYTE TRANSFER USES HIGH BYTE)
+	LDCR	R0,BYTEWIDE
+	RT
+
+PPTRS	BSS	22
+PBUF	BSS	64
+PPADDR	WORD	0
+
+	END

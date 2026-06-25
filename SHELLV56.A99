@@ -58,6 +58,40 @@
 ;        Transparent memory model: XOPs safe from paged code
 ;        Segment 0 COMMON always page 0 - workspace always visible
 ;
+;  5.7   EXE paged chain format support (June 2026)
+;        EXE FILE FORMAT (link99 -Pn chain format, produced by link99 v3.9.10+):
+;          Each block: next_offset(w) page(w) start(w) size(w) [data]
+;          next_offset=0 = last block. page=0 = common/flat.
+;          Loader does single forward pass: MAP_SET, PSEL, copy, follow chain.
+;          Link command: link99 -O1000 -M out.EXE base.R99 mgr.R99 -P2 ovla.R99
+;          -O1000 sets cbase=1000H for base modules (TPA for EXE files).
+;          Overlay modules use AORG 2000H; linked with -Pn for page assignment.
+;
+;        SHELL CHANGES:
+;          EXT_TAB: added EXE (type 2), removed dead CHRT/CHRM/CHRS bytes
+;          L_TRY: save/restore R0 across BDOS (BDOS clobbers R0)
+;                 MOVB *R0,R1 / JNE loop termination (replaces CI R0,EXT_END)
+;          SET_FTY: new subroutine - derives file type from FCB extension
+;                   uses R5/R6 auto-increment, SWPB+MOVB store
+;                   called from L_FOUND and LOADRUN (not raw FCB FTY byte)
+;          LOADRUN: CALL @SET_FTY replaces MOVB @FTY(R4) - reliable type detect
+;          DOLOAD: rewritten for chain block format (old sentinel format removed)
+;                  supports multi-block overlays with sector reload
+;          LOADERCODE_EXE: two-sector staging (EXE_STG to EXE_STG_END)
+;                          no mid-block reload needed for typical EXE files
+;                          all staging addresses via named EQUs (no hardcoding)
+;          MSAVE: new word - preserves R0 across BDOS in L_TRY loop
+;
+;        LINKER REQUIREMENTS (link99 v3.9.10+):
+;          Fix 1: Phase 1 PREL - AORG modules (field>=PAGE_SEG) skip cmod add
+;          Fix 2: Phase 2 PREL - AORG modules (field>=PAGE_SEG) skip cbase add
+;          Fix 3: resolve() - subtract cbase from xrloc for buffer offset
+;
+;        BDOS CHANGES (BDOS57):
+;          GETTYPE rewritten: EXE added (type 2), type numbering corrected
+;          COM=1 EXE=2 TXT=3 BAS=4 PRO=5 - matches shell constants
+;          Uses R5/R6 auto-increment pattern, GT_TAB replaces CHRT/CHRM/CHRS
+;
 ;*******************************************************************
 
 R0	EQU	0
@@ -115,7 +149,7 @@ CMDLINE:	EQU	0250H
 HALT:		EQU	10FFH
 COMM_BUF:	EQU	0300H		;COMMON BUFFER / LOADERCODE AREA
 COMM_FCB:	EQU	0280H
-FCB:		EQU	COMM_FCB
+FCB:	EQU	COMM_FCB
 ;
 ; SHELL ENTRY POINT
 ;
@@ -137,8 +171,6 @@ FCB:		EQU	COMM_FCB
 		BSS	32			;16 WORDS FOR XOP 0 WORKSPACE
 
 	AORG	BDOS_XOP_E			;0x0120 - XOP 0 HANDLER
-		WHEX	R13			;DEBUG - CALLER WP
-		WHEX	R14			;DEBUG - CALLER PC
 	;--- READ CALLER R2 (FUNCTION) AND R3 (PARAM) ---
 		MOV	@4(R13),R2		;CALLER R2 = BDOS FUNCTION CODE
 		MOV	@6(R13),R3		;CALLER R3 = BDOS PARAMETER
@@ -209,8 +241,21 @@ XOP0_WP:	EQU	0040H			;XOP 0 VECTOR - WORKSPACE PTR
 XOP0_PC:	EQU	0042H			;XOP 0 VECTOR - HANDLER PC
 BDOS_XWP:	EQU	0100H			;BDOS XOP WORKSPACE (32 BYTES)
 BDOS_XOP_E:	EQU	0120H			;BDOS XOP HANDLER ENTRY
-STAGING:	EQU	0500H			;SECTOR STAGING BUFFER
-OVL_PRINT_VEC:	EQU	02A0H			;OVERLAY PRINT CALLBACK VECTOR (PAGE VARIABLES AREA)
+STAGING:	EQU	0500H			;SECTOR STAGING BUFFER (COM LOADER)
+EXE_STG:	EQU	0500H			;EXE LOADER STAGING BASE
+EXE_STG2:	EQU	0700H			;EXE LOADER SECOND SECTOR
+EXE_STG_END:	EQU	0900H			;EXE LOADER STAGING END (2 x 512 BYTES)
+STAGING_END:	EQU	STAGING+512		;COM/DOLOAD STAGING END (1 x 512 BYTES)
+;--- OVERLAY MANAGER PAGE VARIABLES (0x02A0-0x02FF) ---
+OVL_PRINT_VEC:	EQU	02A0H			; WORD: APPLICATION PRINT CALLBACK
+OVL_INIT_VEC:	EQU	02A2H			; WORD: ADDRESS OF OVLMGR_INIT
+OVL_SWAP_VEC:	EQU	02A4H			; WORD: ADDRESS OF OVLMGR
+OVL_COUNT:	EQU	02A6H			; WORD: NUMBER OF OVERLAYS REGISTERED BY LOADER
+OVL_CURR_ID:	EQU	02A8H			; WORD: CURRENTLY MAPPED OVLID (0=NONE)
+OVL_CURR_SEG:	EQU	02AAH			; WORD: CURRENTLY MAPPED SEGMENT
+OVL_PAGE_TAB:	EQU	02ACH			; 16 WORDS: PHYSICAL PAGE PER OVLID 1-16
+OVL_SEG_TAB:	EQU	02CCH			; 16 WORDS: VIRTUAL SEGMENT PER OVLID 1-16
+OVLMGR_BASE:	EQU	0A00H			; OVLMGR RESIDENT IN COMMON AT 0A00H
 FLATBASE:	EQU	1000H			;DEFAULT FLAT LOAD ADDRESS
 
 IDE_BYTSEC:	EQU	256
@@ -247,6 +292,7 @@ FSZ	EQU	14
 ;
 ; FILE TYPES
 ;
+SYS	EQU	0
 COM	EQU	1
 EXE	EQU	2
 TXT	EQU	3
@@ -284,8 +330,6 @@ SUBMARK	BYTE	'$'
 SYSFILE	BYTE	'*'
 DOSCMD	BYTE	'+'
 CONSOLE	EQU	0
-EXEC	EQU	2
-PROC	EQU	5
 DEFDRV	EQU	0
 	EVEN
 
@@ -305,6 +349,14 @@ INIT_IV	MOV	R0,*R2+			;STORE WP
 	MOV	R1,*R2+			;STORE PC
 	DEC	R3
 	JNE	INIT_IV
+
+	;--- INIT OVERLAY MANAGER ---
+	; Copy OVLMGR code to common at 0A00H, install vectors
+	BL	@COPY_OVLMGR
+	CLR	R0
+	MOV	R0,@OVL_COUNT
+	MOV	R0,@OVL_CURR_ID
+	MOV	R0,@OVL_CURR_SEG
 
 	LI	R1,CMDLINE
 	LI	R2,CMDLINE2
@@ -388,24 +440,25 @@ DOCMD9	B	@RETURN
 LOOK:	CALL	@PARSENAME
 	CALL	@ICMD
 	CALL	@SEG_SWITCH
-
+;CHECK IF JUST FILE NAME TYPES IN
 	CB	@FCB+EXTOFF,@SPACE
 	JNE	L_START
+;YES ADD WILD CARD
+	LI	R0,'?'*256 ;EXT_TAB
+L_TRY:	MOVB	R0,@FCB+EXTOFF
+	MOVB	R0,@FCB+EXTOFF+1
+	MOVB	R0,@FCB+EXTOFF+2
 
-	LI	R0,EXT_TAB
-L_TRY:	MOVB	*R0+,@FCB+EXTOFF
-	MOVB	*R0+,@FCB+EXTOFF + 1
-	MOVB	*R0+,@FCB+EXTOFF + 2
-
-L_START:	LI	R3,FCB
+L_START:	PUSH	R0		; SAVE R0 - BDOS CLOBBERS IT
+	LI	R3,FCB
 	LI	R2,SEARCH1
 	CALL	@BDOS
+	POP	R0		; RESTORE R0
 	MOV	R1,R1
 	JHE	L_FOUND
 
-	CB	@FCB+EXTOFF,@SPACE
-	CI	R0,EXT_END
-	JL	L_TRY
+	MOVB	*R0,R1		; PEEK AT NEXT ENTRY - SETS CC
+	JNE	L_TRY
 
 LOOKERR:	B	@CMDERR
 
@@ -416,7 +469,7 @@ L_FOUND:	LI	R2,FOPEN
 	JLT	LOOKERR
 	LI	R4,FCB
 	MOV	@FSZ(R4),@MFSZ
-	MOVB	@FTY(R4),@MFTY
+;	CALL	@SET_FTY			; DERIVE FTY FROM EXTENSION
 	B	@LOAD
 
 ;*******************************************************************
@@ -479,10 +532,10 @@ FINDDOT:	CB	*R3+,@EXT
 	CALL	@PADSPACE
 	RET
 
-EXT_TAB:	TEXT	'COMBASBAT'
-CHRT:	BYTE	'T'
-CHRM:	BYTE	'M'
-CHRS:	BYTE	'S'
+EXT_TAB:	TEXT	'COM'
+	TEXT	'EXE'
+	TEXT	'BAS'
+	TEXT	'BAT'
 EXT_END:	BYTE	0
 	EVEN
 
@@ -500,6 +553,36 @@ FILLEXT:	CALL	@PADSPACE
 	RET
 
 ;*******************************************************************
+;	SET_FTY - derive file type from FCB extension, store in MFTY
+;	FCB is absolute at 0280H - @FCB+EXTOFF etc are plain address constants
+;	Uses R5 (table base), R6 (entry walk), R7 (type counter), R0 (scratch)
+;
+SET_FTY:
+	LI	R5,EXT_TAB			; TABLE BASE
+	CLR	R7				; TYPE CODE (0=SYS)
+SFTY_LOOP:
+	MOV	R5,R6				; R6 = ENTRY WALK POINTER
+	MOVB	*R6+,R0				; BYTE 1
+	JEQ	SFTY_NONE			; END OF TABLE
+	INC	R7				; NEXT TYPE CODE
+	CB	R0,@FCB+EXTOFF			; COMPARE BYTE 1
+	JNE	SFTY_NEXT
+	MOVB	*R6+,R0				; BYTE 2
+	CB	R0,@FCB+EXTOFF+1		; COMPARE BYTE 2
+	JNE	SFTY_NEXT
+	MOVB	*R6,R0				; BYTE 3
+	CB	R0,@FCB+EXTOFF+2		; COMPARE BYTE 3
+	JEQ	SFTY_FOUND
+SFTY_NEXT:
+	AI	R5,3				; NEXT ENTRY
+	JMP	SFTY_LOOP
+SFTY_NONE:
+	CLR	R7				; NO MATCH - SYS=0
+SFTY_FOUND:
+	SWPB	R7				; TYPE TO HIGH BYTE FOR MOVB
+	MOVB	R7,@MFTY			; STORE TYPE CODE
+	RET
+;
 ;	LOAD - load executable file
 ;
 ;	FLA in FCB gives load address (0 = use TPA).
@@ -533,15 +616,20 @@ LOADF1	MOV	R3,@FREEMEM
 	B	@NEXTCMD
 
 LOADRUN:
-	MOVB	@MFTY,R1
+	MOVB	@FTY(R4),R1
 	SRL	R1,8
 	CI	R1,COM
 	JNE	LT2
 	B	@GOPROG
 LT2	CI	R1,EXE
 	JNE	LT3
-	B	@GOPROG
-LT3	CI	R1,0
+	B	@GOPROG_EXE		;EXE - PAGED CHAIN FORMAT
+;
+;IS THIS CODE REDUNDANT?  E TO DO TO DO
+;
+LT3	;B	@NEXTCMD
+
+	CI	R1,0
 	JNE	LT4
 	B	@GOPROG
 LT4
@@ -561,7 +649,7 @@ LOAD0	LI	R2,SETDMA
 LOAD1	MOV	R3,@FREEMEM
 	MOVB	@MFTY,R1
 	SRL	R1,8
-	CI	R1,PROC
+	CI	R1,PRO
 	JNE	LOAD1B
 	B	@NEXTCMD
 LOAD1B	CI	R1,TXT
@@ -595,52 +683,365 @@ IL0:	MOV	*R1+,*R2+
 	RET
 
 ;*******************************************************************
-;  LOADERCODE v5.6
+;	GOPROG_EXE - stub for paged EXE chain format (v5.7)
+;	Called when file type is EXE. Returns to caller.
+;	Full implementation pending BDOS EXE type verification.
+;*******************************************************************
+;*******************************************************************
+;	GOPROG_EXE - run EXE (paged chain format) via LOADERCODE_EXE
+;*******************************************************************
+GOPROG_EXE:
+	LI	R4,CMDLINE
+GOLOOP_E:
+	INC	R4
+	CB	*R4,@SPACE
+	JH	GOLOOP_E
+	CLR	R1
+	MOVB	R1,@CMDLINE-1
+	LI	R0,SHELL_PTR
+	DECT	SP
+	MOV	R0,*SP
+	CALL	@INIT_LOADER_EXE
+	B	@LOADER
+
+;*******************************************************************
+;	INIT_LOADER_EXE - copy LOADERCODE_EXE to LOADER (0x0300)
+;*******************************************************************
+INIT_LOADER_EXE:
+	LI	R2,LOADER
+	LI	R1,LOADERCODE_EXE
+ILE0:	MOV	*R1+,*R2+
+	CI	R1,END_LOADER_EXE
+	JL	ILE0
+	RET
+
+;*******************************************************************
+;  LOADERCODE_EXE v5.7
 ;
-;  Copied to LOADER (0x0300) by INIT_LOADER, runs from COMMON.
+;  Copied to LOADER (0x0300) by INIT_LOADER_EXE. Runs from COMMON.
 ;
-;  STAGING buffer: 0x0500, 512 bytes, always in common memory.
-;  First sector always read to STAGING for format detection.
-;  LADDR: FCB load address - used only for raw binary.
+;  Reads .EXE paged chain format produced by link99 v3.9.10.
 ;
-;  File format detection (first word of staging buffer):
-;    FFFF = link99 format:
-;           FFFF FFFF FFFF   opening sentinel
-;           start end page   pagemap entry (one entry for now)
-;           FFFF FFFF FFFF   closing sentinel
-;           size data...     one block
-;    else = raw binary: load flat to LADDR, launch from LADDR
+;  Block header (8 bytes):
+;    +0  next_offset  word  byte distance from THIS header to next (0=last)
+;    +2  page         word  physical page (0=common/flat)
+;    +4  start        word  virtual load address
+;    +6  size         word  byte count of data following header
+;    +8  [data...]
 ;
-;  Paged load sequence:
-;    1. Clear all map registers to page 0
-;    2. Read first sector to STAGING
-;    3. Detect format
-;    4. Walk pagemap entries, call MAP_SET for each segment
-;    5. Enable PSEL once after all MAP_SET calls
-;    6. Copy block to destination (LDRCPY/LDRSEC)
-;    7. Launch from R8 (first pagemap entry start)
+;  Single forward pass:
+;    R6 -> header. Save R7=R6 (header start). Consume 4 words.
+;    Capture R8 from first block start only.
+;    MAP_SET if page != 0.
+;    PSEL on. Copy size bytes from R6 to start. PSEL off.
+;    If next_offset == 0 -> LDRRUN (launch).
+;    R6 = R7 + next_offset. Loop.
+;    Sector reload (LDRSEC_E) preserves R5/R7/R8 across BDOS.
+;    After reload R6 = STAGING + (old R6 - STAGING end).
+;
+;  Branches to LDRRUN/LDRRUN_LOAD/LDRERR in shell (always resident).
 ;
 ;  Key registers:
-;    R1   source in STAGING (reset each sector reload)
-;    R2   paged destination (walks continuously)
-;    R3   words remaining (saved/restored across BDOS via stack)
-;    R4   end of STAGING = 0x0700
-;    R6   walks STAGING: pagemap then block data
-;    R7   segment walker in LDRSEG
-;    R8   launch address (first pagemap entry start)
+;    R2   paged destination (start address, reset each block)
+;    R3   word count (saved across BDOS)
+;    R4   end of STAGING = EXE_STG_END
+;    R5   next_offset (saved across block copy and BDOS)
+;    R6   current STAGING pointer (header then data)
+;    R7   header start (for next_offset arithmetic)
+;    R8   launch address (first block start, never changed after)
 ;    R9   scratch / PSEL value
 ;*******************************************************************
 
-LOADERCODE:
+LOADERCODE_EXE:
 
 ;--- CLEAR ALL MAP REGISTERS TO PAGE 0 ---
 	LI	R12,MAP_WIN_BASE
 	CLR	R0
 	LI	R1,NUM_SEGS
-LDRCL:	LDCR	R0,BYTEWIDE
+LDRCL_E:
+	LDCR	R0,BYTEWIDE
 	INCT	R12
 	DEC	R1
-	JNE	LDRCL
+	JNE	LDRCL_E
+
+;--- READ TWO SECTORS TO STAGING (EXE_STG to EXE_STG_END) ---
+; Two sectors avoids mid-block reload, keeping chain arithmetic valid.
+	CLR	R0
+	LI	R3,EXE_STG
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	CI	R1,-1
+	JNE	LDREDET_E
+	B	@LDRRUN			;EMPTY FILE
+LDREDET_E:
+	MOV	R1,R1
+	JLT	LDRERR_B
+	JMP	LDREDET_OK
+LDRERR_B:
+	B	@LDRERR
+LDREDET_OK:
+	;--- READ SECOND SECTOR TO EXE_STG2 ---
+	LI	R3,EXE_STG2
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	; IGNORE RESULT - FILE MAY FIT IN ONE SECTOR
+
+	LI	R6,EXE_STG		;R6 = FIRST BLOCK HEADER
+	LI	R4,EXE_STG_END		;R4 = END OF STAGING
+	CLR	R8			;R8=0 = LAUNCH ADDRESS NOT YET CAPTURED
+	CLR	@OVL_COUNT		;RESET OVERLAY COUNTER BEFORE LOADING
+
+;--- PROCESS ONE BLOCK HEADER ---
+LDRBLK_E:
+	MOV	R6,R7			;R7 = HEADER START (FOR NEXT_OFFSET CALC)
+	MOV	*R6+,R5			;R5 = NEXT_OFFSET
+	MOV	*R6+,R0			;R0 = PAGE
+	MOV	*R6+,R2			;R2 = START (COPY DESTINATION)
+	MOV	*R6+,R3			;R3 = SIZE IN BYTES
+				;R6 NOW AT FIRST DATA BYTE OF THIS BLOCK
+
+;--- CAPTURE LAUNCH ADDRESS FROM FIRST BLOCK ONLY ---
+	MOV	R8,R8
+	JNE	LDRMAP_E
+	MOV	R2,R8			;R8 = LAUNCH ADDRESS (FIRST BLOCK START)
+
+;--- PROGRAM MAPPER IF PAGED, REGISTER IN OVERLAY TABLES ---
+LDRMAP_E:
+	MOV	R0,R0
+	JEQ	LDRCPY_E		; PAGE 0 = COMMON, NO MAP_SET OR TABLE ENTRY
+
+	;--- INCREMENT OVLID COUNTER AND REGISTER THIS BLOCK ---
+	; OVL_COUNT starts at 0; each paged block gets next OVLID (1-based)
+	INC	@OVL_COUNT		; OVLID = OVL_COUNT (1=first paged block)
+	MOV	@OVL_COUNT,R1		; R1 = OVLID
+	DEC	R1			; R1 = OVLID-1 (0-based word offset)
+	SLA	R1,1			; R1 = (OVLID-1)*2
+	MOV	R0,@OVL_PAGE_TAB(R1)	; STORE PHYSICAL PAGE
+	MOV	R2,R9
+	SRL	R9,12			; SEGMENT = START >> 12
+	MOV	R9,@OVL_SEG_TAB(R1)	; STORE VIRTUAL SEGMENT
+
+	BL	@MAP_SET		; R9=SEGMENT R0=PAGE
+
+;--- ENABLE PSEL AND COPY BLOCK ---
+LDRCPY_E:
+	LI	R9,PSEL_EN
+	PSEL	R9
+	SRL	R3,1			;BYTES TO WORDS
+					;R3 = WORD COUNT
+LDRCPYW_E:
+	MOV	*R6+,*R2+		;COPY WORD STAGING -> PAGED
+	DEC	R3
+	JEQ	LDRDONE_E		;BLOCK DONE
+	C	R6,R4
+	JL	LDRCPYW_E		;MORE IN STAGING
+
+;--- STAGING EXHAUSTED MID-BLOCK: RELOAD ---
+LDRSEC_E:
+	CLR	R9
+	PSEL	R9			;PSEL OFF BEFORE BDOS
+	DECT	SP
+	MOV	R8,*SP			;SAVE LAUNCH ADDRESS
+	DECT	SP
+	MOV	R7,*SP			;SAVE HEADER START
+	DECT	SP
+	MOV	R5,*SP			;SAVE NEXT_OFFSET
+	DECT	SP
+	MOV	R3,*SP			;SAVE WORD COUNT
+	DECT	SP
+	MOV	R2,*SP			;SAVE PAGED DESTINATION
+	LI	R3,EXE_STG
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R2			;RESTORE PAGED DESTINATION
+	MOV	*SP+,R3			;RESTORE WORD COUNT
+	MOV	*SP+,R5			;RESTORE NEXT_OFFSET
+	MOV	*SP+,R7			;RESTORE HEADER START
+	MOV	*SP+,R8			;RESTORE LAUNCH ADDRESS
+	CI	R1,-1
+	JNE	LDRSEC_EOK
+	B	@LDRRUN			;EOF
+LDRSEC_EOK:
+	LI	R9,PSEL_EN
+	PSEL	R9
+	LI	R6,EXE_STG		;RESET SOURCE
+	LI	R4,EXE_STG_END		;RESET END OF STAGING
+	JMP	LDRCPYW_E
+
+;--- BLOCK COPY COMPLETE ---
+LDRDONE_E:
+	CLR	R9
+	PSEL	R9			;PSEL OFF
+
+;--- FOLLOW CHAIN ---
+	MOV	R5,R5
+	JNE	LDRCHAIN_E
+	B	@LDRRUN			;NEXT_OFFSET=0: LAST BLOCK, LAUNCH
+LDRCHAIN_E:
+
+	A	R5,R7			;R7 = HEADER START + NEXT_OFFSET = NEXT HEADER
+	MOV	R7,R6			;R6 = NEXT HEADER
+
+;--- CHECK IF NEXT HEADER IN STAGING ---
+	C	R6,R4
+	JL	LDRBLK_E		;IN STAGING - PROCESS IT
+
+;--- NEXT HEADER BEYOND STAGING: RELOAD ---
+;  next header may land in the next sector. Calculate overshoot,
+;  reload, position R6 at overshoot offset within new sector.
+	S	R4,R6			;R6 = BYTES PAST END OF STAGING
+	DECT	SP
+	MOV	R8,*SP			;SAVE LAUNCH ADDRESS
+	DECT	SP
+	MOV	R5,*SP			;SAVE NEXT_OFFSET (DONE WITH IT BUT TIDY)
+	DECT	SP
+	MOV	R6,*SP			;SAVE OVERSHOOT
+	LI	R3,EXE_STG
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R6			;RESTORE OVERSHOOT
+	MOV	*SP+,R5
+	MOV	*SP+,R8			;RESTORE LAUNCH ADDRESS
+	LI	R4,EXE_STG_END
+	AI	R6,EXE_STG		;R6 = STAGING + OVERSHOOT
+	JMP	LDRBLK_E
+
+END_LOADER_EXE:	EQU	$+0
+
+;*******************************************************************
+;  COPY_OVLMGR - copy OVLMGR code to common at OVLMGR_BASE (0A00H)
+;
+;  Called once at shell startup (INIT). Copies OVLMGR_CODE to 0A00H
+;  then installs vectors at OVL_INIT_VEC/OVL_SWAP_VEC.
+;  Uses BL/RT (R11 = return address).
+;  Modifies: R0, R1, R2
+;*******************************************************************
+COPY_OVLMGR:
+	LI	R0,OVLMGR_CODE			; SOURCE IN SHELL
+	LI	R1,OVLMGR_BASE			; DESTINATION = 0A00H
+	LI	R2,OVLMGR_CODE_END-OVLMGR_CODE	; SIZE IN BYTES
+	SRL	R2,1				; TO WORDS
+COPY_OVL1:
+	MOV	*R0+,*R1+
+	DEC	R2
+	JNE	COPY_OVL1
+	;--- INSTALL VECTOR ADDRESSES ---
+	; Callers use: MOV @OVL_INIT_VEC,R0 / BL *R0
+	LI	R0,OVLMGR_CI			; ADDRESS OF OVLMGR_INIT CODE
+	MOV	R0,@OVL_INIT_VEC		; 02A2H
+	LI	R0,OVLMGR_C			; ADDRESS OF OVLMGR CODE
+	MOV	R0,@OVL_SWAP_VEC		; 02A4H
+	RT
+
+;*******************************************************************
+;  OVLMGR_CODE - overlay manager code stored in shell, copied to 0A00H
+;
+;  This is position-independent code - all addresses are absolute.
+;  When copied to 0A00H the layout is:
+;    0A00H  B @OVLMGR_INIT  (4 bytes)
+;    0A04H  B @OVLMGR       (4 bytes)
+;    0A08H  OVLMGR_INIT code
+;    0A??H  OVLMGR code
+;
+;  NOTE: assembled inline here but logically runs at 0A00H.
+;  All absolute addresses (OVL_PAGE_TAB, MAP_WIN_BASE etc) are
+;  correct regardless of where this code is stored in the shell.
+;*******************************************************************
+OVLMGR_CODE:
+	;--- VECTOR TABLE ---
+	B	@OVLMGR_CI			; 0A00H: -> OVLMGR_INIT
+	B	@OVLMGR_C			; 0A04H: -> OVLMGR
+
+	;--- OVLMGR_INIT ---
+	; Clear current overlay state, enable PSEL
+	; Entry: nothing  Exit: OVL_CURR_ID=0, PSEL enabled
+	; R11 = return address (BL caller)
+OVLMGR_CI:
+	CLR	R0
+	MOV	R0,@OVL_CURR_ID			; NO OVERLAY LOADED
+	MOV	R0,@OVL_CURR_SEG			; NO SEGMENT MAPPED
+	LI	R9,PSEL_EN
+	PSEL	R9				; ENABLE PSEL
+	B	*R11				; RETURN (BL caller)
+
+	;--- OVLMGR ---
+	; Entry:  R1 = OVLID (1-based)
+	; Exit:   segment mapped to physical page, PSEL enabled
+	; Modifies: R0, R3, R9, R12
+	; Preserves: R1, R2, R4-R8, R10, R11, R13-R15
+OVLMGR_C:
+	;--- ALREADY LOADED? ---
+	C	R1,@OVL_CURR_ID
+	JEQ	OVLMGR_CR			; YES - NOTHING TO DO
+
+	;--- UPDATE CURRENT STATE ---
+	MOV	R1,@OVL_CURR_ID
+
+	;--- LOOK UP PAGE AND SEGMENT FOR THIS OVLID ---
+	; Tables at OVL_PAGE_TAB/OVL_SEG_TAB, word-indexed by (OVLID-1)
+	MOV	R1,R3
+	DEC	R3				; R3 = OVLID-1 (0-based)
+	SLA	R3,1				; R3 = (OVLID-1)*2 (word offset)
+						; NOTE: R0 cannot be used as index on TMS9900
+	MOV	@OVL_PAGE_TAB(R3),R0		; R0 = PHYSICAL PAGE
+	MOV	@OVL_SEG_TAB(R3),R9		; R9 = VIRTUAL SEGMENT
+	MOV	R9,@OVL_CURR_SEG
+
+	;--- DISABLE PSEL BEFORE CRU ACCESS ---
+	CLR	R12
+	PSEL	R12
+
+	;--- PROGRAM MAPPER: SEGMENT R9 -> PAGE R0 ---
+	LI	R12,MAP_WIN_BASE
+	SLA	R9,1				; SEGMENT*2 = CRU BIT OFFSET
+	A	R9,R12				; R12 = CRU ADDRESS FOR THIS SEGMENT
+	SLA	R0,8				; PAGE TO HIGH BYTE FOR LDCR
+	LDCR	R0,BYTEWIDE
+
+	;--- RE-ENABLE PSEL ---
+	LI	R9,PSEL_EN
+	PSEL	R9
+
+OVLMGR_CR:
+	B	*R11				; RETURN (BL caller)
+
+OVLMGR_CODE_END:	EQU	$+0
+
+;*******************************************************************
+;  LOADERCODE v5.7
+;
+;  Copied to LOADER (0x0300) by INIT_LOADER. Runs from COMMON.
+;  Handles .COM flat binary files only.
+;  .EXE paged chain format is handled by LOADERCODE_EXE.
+;
+;  Load sequence:
+;    1. Read first sector to STAGING
+;    2. Copy STAGING to LADDR, read remaining sectors to LADDR+N
+;    3. Launch from LADDR (no PSEL, mapper untouched)
+;
+;  Key registers:
+;    R3   sector DMA address / load pointer
+;    R9   launch address (= LADDR)
+;*******************************************************************
+
+LOADERCODE:
+
+;--- ENSURE PSEL DISABLED BEFORE ANY BDOS CALLS ---
+	CLR	R15
+	ORI	R15,0007H		;INTERRUPT MASK=7, PSEL BIT CLEAR
+	LST	R15
 
 ;--- READ FIRST SECTOR TO STAGING (0x0500) ---
 	CLR	R0
@@ -655,116 +1056,9 @@ LDRCL:	LDCR	R0,BYTEWIDE
 	B	@LDRRUN_F		;EMPTY FILE
 LDRDET:	MOV	R1,R1
 	JLT	LDRDET_ERR
-	JMP	LDRDET1
+	JMP	LDRRAW
 LDRDET_ERR:
 	B	@LDRERR
-LDRDET1:
-
-;--- DETECT FORMAT ---
-;  First word FFFF = link99 format (opening sentinel)
-;  Anything else  = raw binary
-	LI	R6,0500H		;START OF STAGING
-	MOV	*R6,R0
-	CI	R0,0FFFFH
-	JNE	LDRDET2			;NOT FFFF = RAW BINARY
-	JMP	LDRPM
-LDRDET2:	B	@LDRRAW
-
-;--- WALK PAGEMAP ---
-;  R6 points at current sentinel on first entry and after each entry
-;  LDRPM:  skip sentinel then peek at next word
-;  LDRPM1: re-entry point after processing an entry (R6 at next sentinel)
-LDRPM:	AI	R6,6			;SKIP SENTINEL - R6 NOW AT ENTRY OR CLOSING SENTINEL
-LDRPM1:	MOV	*R6,R0
-	CI	R0,0FFFFH
-	JEQ	LDRSENT			;CLOSING SENTINEL = END OF PAGEMAP
-	MOV	*R6+,R7			;R7 = START ADDRESS
-	MOV	R7,R8			;R8 = LAUNCH ADDRESS (FIRST ENTRY)
-	MOV	*R6+,R1			;R1 = END ADDRESS
-	MOV	*R6+,R4			;R4 = PAGE NUMBER
-	MOV	R4,R0
-	JEQ	LDRPM1			;PAGE 0 = FLAT - SKIP MAP_SET - R6 AT NEXT SENTINEL
-
-LDRSEG:	MOV	R7,R0
-	SRL	R0,12			;SEGMENT = ADDR >> 12
-	CI	R0,PROT_SEG
-	JHE	LDRPROT
-	MOV	R0,R9			;R9 = SEGMENT
-	MOV	R4,R0			;R0 = PAGE
-	BL	@MAP_SET
-LDRPROT:
-	AI	R7,SEG_SIZE
-	C	R7,R1
-	JL	LDRSEG
-	JMP	LDRPM1			;NEXT ENTRY - R6 ALREADY AT NEXT SENTINEL
-
-;--- CLOSING SENTINEL: ENABLE PSEL, SET UP COPY ---
-LDRSENT:
-	AI	R6,6			;SKIP CLOSING SENTINEL
-	MOV	R8,R2			;R2 = COPY DESTINATION
-	LI	R9,PSEL_EN
-	PSEL	R9			;ENABLE PSEL ONCE
-
-;--- READ BLOCK SIZE AND SET UP WORD COUNT ---
-LDRBLK:	MOV	*R6,R5
-	CI	R5,0FFFFH
-	JEQ	LDRRUN
-	CI	R5,0
-	JEQ	LDRRUN
-	INCT	R6			;SKIP SIZE WORD
-	MOV	R6,R1			;R1 = SOURCE
-	SRL	R5,1			;BYTES TO WORDS
-	MOV	R5,R3			;R3 = WORD COUNT
-	LI	R4,0700H		;R4 = END OF STAGING
-
-;--- COPY WORDS: STAGING -> PAGED MEMORY (PSEL ACTIVE) ---
-LDRCPY:	MOV	*R1+,*R2+
-	DEC	R3
-	JEQ	LDRRUN			;ALL WORDS DONE
-	C	R1,R4
-	JL	LDRCPY			;MORE IN STAGING
-
-;--- STAGING EXHAUSTED: RELOAD NEXT SECTOR TO STAGING ---
-;  Stack saves are safe - BDOS uses own workspace via CALL XOP
-LDRSEC:	DECT	SP
-	MOV	R8,*SP			;SAVE LAUNCH ADDRESS
-	DECT	SP
-	MOV	R2,*SP			;SAVE PAGED DESTINATION
-	DECT	SP
-	MOV	R3,*SP			;SAVE WORD COUNT
-	LI	R3,0500H		;DMA TO STAGING
-	LI	R2,SETDMA
-	CALL	@BDOS
-	LI	R2,RDSEQ
-	LI	R3,FCB
-	CALL	@BDOS
-	MOV	*SP+,R3			;RESTORE WORD COUNT
-	MOV	*SP+,R2			;RESTORE PAGED DESTINATION
-	MOV	*SP+,R8			;RESTORE LAUNCH ADDRESS
-	CI	R1,-1
-	JEQ	LDRRUN			;EOF - ALL DATA LOADED
-	LI	R9,PSEL_EN		;RE-ENABLE PSEL
-	PSEL	R9
-	LI	R1,0500H		;RESET SOURCE TO START OF STAGING
-	LI	R4,0700H		;RESET END OF STAGING
-	JMP	LDRCPY			;RESUME COPY
-
-;--- LAUNCH PAGED PROGRAM ---
-LDRRUN:	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
-	JNE	LDRRUN_LOAD		;YES - SKIP EXECUTE
-	LI	R0,INT2_HANDLER
-	MOV	R0,@INT2_VEC
-	CLR	R15
-	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
-	LST	R15
-	B	*R8
-LDRRUN_LOAD:
-	CLR	R9
-	PSEL	R9			;DISABLE PSEL
-	CLR	R0
-	MOV	R0,@LOAD_ONLY		;CLEAR FLAG
-	MESG	@TXT_LOADED		;CONFIRM LOAD
-	B	@NEXTCMD		;BACK TO SHELL PROMPT
 
 ;--- RAW BINARY: LOAD TO LADDR, LAUNCH FROM LADDR ---
 LDRRAW:	MOV	@LADDR,R9		;R9 = LAUNCH ADDRESS
@@ -798,10 +1092,14 @@ LDRRAWS_ERR:
 ;--- LAUNCH RAW/FLAT (NO PSEL) ---
 LDRRUN_F:
 	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
-	JNE	LDRRUN_LOAD		;YES - SKIP EXECUTE
+	JEQ	LDRRUN_F1		;NO - EXECUTE
+	B	@LDRRUN_LOAD		;YES - ABSOLUTE BRANCH TO SHELL
+LDRRUN_F1:
 	LI	R0,INT2_HANDLER		;INSTALL INT2 DEBUG HANDLER
 	MOV	R0,@INT2_VEC
-	CLR	R15
+	CLR	R0			;DISABLE PSEL WITHOUT CLOBBERING R9
+	PSEL	R0			;ENSURE PSEL DISABLED FOR FLAT COM LAUNCH
+	CLR	R15			;CLEAR ALL STATUS BITS
 	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
 	LST	R15
 	MOV	R9,R2
@@ -818,6 +1116,35 @@ TXT_LOADED:	TEXT	'Loaded'
 		EVEN
 
 END_LOADER:	EQU	$+0
+
+;*******************************************************************
+;  LDRRUN / LDRRUN_LOAD - permanent shell routines
+;  Called by both LOADERCODE (COM) and LOADERCODE_EXE (EXE).
+;  Must live in protected shell segments, never inside a LOADERCODE
+;  block. Absolute B @LDRRUN branches from COMMON are safe because
+;  shell is always resident in segments 12-15.
+;*******************************************************************
+
+;--- LAUNCH PAGED PROGRAM (PSEL WILL BE ENABLED) ---
+LDRRUN:	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
+	JNE	LDRRUN_LOAD		;YES - SKIP EXECUTE
+	LI	R0,INT2_HANDLER
+	MOV	R0,@INT2_VEC
+	CLR	R15
+	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
+	LST	R15
+	LI	R9,PSEL_EN		;ENABLE PSEL BEFORE LAUNCH
+	PSEL	R9
+;	HALT
+	B	*R8			;LAUNCH FROM R8
+
+LDRRUN_LOAD:
+	CLR	R9
+	PSEL	R9			;DISABLE PSEL
+	CLR	R0
+	MOV	R0,@LOAD_ONLY		;CLEAR FLAG
+	MESG	@TXT_LOADED		;CONFIRM LOAD
+	B	@NEXTCMD		;BACK TO SHELL PROMPT
 ;*******************************************************************
 ;	RETURN - program exit
 ;*******************************************************************
@@ -1177,8 +1504,9 @@ DLSK1	CB	*R3+,@SPACE		;SKIP COMMAND NAME
 	JH	DLSK1
 	DEC	R3
 DLSK2	CB	*R3,@CR			;END OF LINE?
-	JEQ	DLERR
-	CB	*R3+,@SPACE		;SKIP SPACES
+	JNE	DLSK_E
+	B	@DLERR
+DLSK_E	CB	*R3+,@SPACE		;SKIP SPACES
 	JLE	DLSK2
 	DEC	R3
 	CALL	@PARSENAME		;FCB = OVERLAY NAME+EXT
@@ -1190,7 +1518,9 @@ DLSK2	CB	*R3,@CR			;END OF LINE?
 	LI	R3,FCB
 	CALL	@BDOS
 	MOV	R1,R1
-	JLT	DLERR
+	JHE	DLSK_F
+	B	@DLERR
+DLSK_F
 
 	;--- READ FIRST SECTOR ---
 	LI	R3,STAGING
@@ -1200,78 +1530,107 @@ DLSK2	CB	*R3,@CR			;END OF LINE?
 	LI	R3,FCB
 	CALL	@BDOS
 	CI	R1,-1
-	JEQ	DLERR
+	JNE	DLSK_G
+	B	@DLERR
+DLSK_G
 
-	;--- CHECK PAGEMAP HEADER ---
-	LI	R6,STAGING
-	MOV	*R6,R0
-	CI	R0,0FFFFH
-	JNE	DLERR
-	AI	R6,6			;SKIP OPENING SENTINEL
+	;--- PROCESS CHAIN BLOCKS ---
+	; Header: next_offset(w) page(w) start(w) size(w) [data]
+	LI	R6,STAGING			; CURRENT POINTER
+	LI	R8,STAGING_END			; END OF STAGING
 
-	;--- WALK PAGEMAP ENTRIES ---
-DLPM	MOV	*R6,R0
-	CI	R0,0FFFFH
-	JEQ	DLSENT			;CLOSING SENTINEL
-	MOV	*R6+,R7			;START ADDRESS
-	MOV	*R6+,R1			;END (UNUSED)
-	MOV	*R6+,R4			;PAGE NUMBER
+DLBLK:
+	MOV	R6,R7				; R7 = HEADER START
+	MOV	*R6+,R5				; R5 = NEXT_OFFSET
+	MOV	*R6+,R4				; R4 = PAGE
+	MOV	*R6+,R2				; R2 = START (DESTINATION)
+	MOV	*R6+,R3				; R3 = SIZE IN BYTES
+
+	;--- MAP_SET IF PAGED ---
 	MOV	R4,R0
-	JEQ	DLPM			;PAGE 0 = SKIP
-	MOV	R7,R9
-	SRL	R9,12			;SEGMENT = ADDR>>12
-	MOV	R4,R0
-	BL	@MAP_SET
-	JMP	DLPM
+	JEQ	DLCPY_S				; PAGE 0 = NO MAP_SET
+	MOV	R2,R9
+	SRL	R9,12				; SEGMENT = START>>12
+	BL	@MAP_SET			; R9=SEGMENT R0=PAGE
 
-	;--- LOAD BLOCK ---
-DLSENT	AI	R6,6			;SKIP CLOSING SENTINEL
-	MOV	*R6+,R5			;BLOCK SIZE (BYTES)
-	SRL	R5,1			;TO WORDS
-	MOV	R7,R2			;DESTINATION
+DLCPY_S:
 	LI	R9,PSEL_EN
-	PSEL	R9			;ENABLE PSEL
-	MOV	R6,R1			;SOURCE IN STAGING
-	LI	R4,STAGING+512		;END OF STAGING
-DLCPY	MOV	*R1+,*R2+
-	DEC	R5
-	JEQ	DLDONE
-	C	R1,R4
+	PSEL	R9				; PSEL ON
+	SRL	R3,1				; BYTES TO WORDS
+DLCPY:
+	MOV	*R6+,*R2+			; COPY WORD
+	DEC	R3
+	JEQ	DLDONE_B			; BLOCK DONE
+	C	R6,R8
 	JL	DLCPY
 
-	;--- NEXT SECTOR ---
-	DECT	SP
-	MOV	R2,*SP
-	DECT	SP
-	MOV	R5,*SP
+	;--- STAGING EXHAUSTED - RELOAD ---
 	CLR	R9
-	PSEL	R9			;DISABLE PSEL FOR BDOS
+	PSEL	R9				; PSEL OFF
+	DECT	SP
+	MOV	R7,*SP				; SAVE HEADER START
+	DECT	SP
+	MOV	R5,*SP				; SAVE NEXT_OFFSET
+	DECT	SP
+	MOV	R3,*SP				; SAVE WORD COUNT
+	DECT	SP
+	MOV	R2,*SP				; SAVE DESTINATION
 	LI	R3,STAGING
 	LI	R2,SETDMA
 	CALL	@BDOS
 	LI	R2,RDSEQ
 	LI	R3,FCB
 	CALL	@BDOS
-	MOV	*SP+,R5
 	MOV	*SP+,R2
+	MOV	*SP+,R3
+	MOV	*SP+,R5
+	MOV	*SP+,R7
 	CI	R1,-1
-	JEQ	DLDONE
+	JEQ	DLDONE_B			; EOF
 	LI	R9,PSEL_EN
 	PSEL	R9
-	LI	R1,STAGING
-	LI	R4,STAGING+512
+	LI	R6,STAGING
+	LI	R8,STAGING_END
 	JMP	DLCPY
 
-DLDONE	CLR	R9
-	PSEL	R9			;DISABLE PSEL
+DLDONE_B:
+	CLR	R9
+	PSEL	R9				; PSEL OFF
+	MOV	R5,R5
+	JEQ	DLDONE				; NEXT_OFFSET=0: LAST BLOCK
+	A	R5,R7
+	MOV	R7,R6				; R6 = NEXT HEADER
+	C	R6,R8
+	JL	DLBLK				; IN STAGING
+	;--- NEXT HEADER BEYOND STAGING: RELOAD ---
+	S	R8,R6				; OVERSHOOT
+	DECT	SP
+	MOV	R5,*SP
+	DECT	SP
+	MOV	R6,*SP				; SAVE OVERSHOOT
+	LI	R3,STAGING
+	LI	R2,SETDMA
+	CALL	@BDOS
+	LI	R2,RDSEQ
+	LI	R3,FCB
+	CALL	@BDOS
+	MOV	*SP+,R6
+	MOV	*SP+,R5
+	LI	R8,STAGING_END
+	AI	R6,STAGING			; R6 = STAGING + OVERSHOOT
+	JMP	DLBLK
+
+DLDONE:
 	MESG	@DLTXT_OK
 	B	@NEXTCMD
 
 DLERR	MESG	@DLTXT_ERR
 	B	@NEXTCMD
 
-DLTXT_OK	TEXT	'Loaded'
-	BYTE	0DH,0AH,0
+DLTXT_OK	TEXT	'Loaded as overlay '
+	BYTE	0
+	EVEN
+DLTXT_CRLF	BYTE	0DH,0AH,0
 	EVEN
 DLTXT_ERR	TEXT	'--Load error'
 	BYTE	0DH,0AH,0
@@ -1454,11 +1813,13 @@ WAIT	LI	R4,WAITMSG
 	CALL	@OUTSTR
 	CLR	R1
 	CALL	@CIN
-	DECT	SP
-	MOV	R1,*SP
+	PUSH	R1
+;	DECT	SP
+;	MOV	R1,*SP
 	MOVB	@CR,R3
 	CALL	@OUTCHAR
-	MOV	*SP+,R1
+;	MOV	*SP+,R1
+	POP	R1
 	CB	R1,@CR
 	JEQ	BPFETCH
 	CB	R1,@CTLC
@@ -1636,6 +1997,7 @@ MNAM		BSS	NAMSIZ
 		BSS	2
 		EVEN
 MFTY		WORD	0
+;MSAVE		WORD	0				; R0 SAVE ACROSS BDOS IN L_TRY
 MFSZ		WORD	0
 		BSS	8
 MCNT		WORD	0
@@ -1645,7 +2007,7 @@ MADDR		WORD	0
 ;	Messages
 ;*******************************************************************
 SINON	BYTE	0DH,0AH
-	TEXT	'Shell Version 5.6'
+	TEXT	'Shell Version 5.7'
 	BYTE	0DH,0AH
 	TEXT	'TMS99105 SBC V4 - Paged Memory'
 	BYTE	0DH,0AH

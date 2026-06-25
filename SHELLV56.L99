@@ -58,6 +58,40 @@
                         ;        Transparent memory model: XOPs safe from paged code
                         ;        Segment 0 COMMON always page 0 - workspace always visible
                         ;
+                        ;  5.7   EXE paged chain format support (June 2026)
+                        ;        EXE FILE FORMAT (link99 -Pn chain format, produced by link99 v3.9.10+):
+                        ;          Each block: next_offset(w) page(w) start(w) size(w) [data]
+                        ;          next_offset=0 = last block. page=0 = common/flat.
+                        ;          Loader does single forward pass: MAP_SET, PSEL, copy, follow chain.
+                        ;          Link command: link99 -O1000 -M out.EXE base.R99 mgr.R99 -P2 ovla.R99
+                        ;          -O1000 sets cbase=1000H for base modules (TPA for EXE files).
+                        ;          Overlay modules use AORG 2000H; linked with -Pn for page assignment.
+                        ;
+                        ;        SHELL CHANGES:
+                        ;          EXT_TAB: added EXE (type 2), removed dead CHRT/CHRM/CHRS bytes
+                        ;          L_TRY: save/restore R0 across BDOS (BDOS clobbers R0)
+                        ;                 MOVB *R0,R1 / JNE loop termination (replaces CI R0,EXT_END)
+                        ;          SET_FTY: new subroutine - derives file type from FCB extension
+                        ;                   uses R5/R6 auto-increment, SWPB+MOVB store
+                        ;                   called from L_FOUND and LOADRUN (not raw FCB FTY byte)
+                        ;          LOADRUN: CALL @SET_FTY replaces MOVB @FTY(R4) - reliable type detect
+                        ;          DOLOAD: rewritten for chain block format (old sentinel format removed)
+                        ;                  supports multi-block overlays with sector reload
+                        ;          LOADERCODE_EXE: two-sector staging (EXE_STG to EXE_STG_END)
+                        ;                          no mid-block reload needed for typical EXE files
+                        ;                          all staging addresses via named EQUs (no hardcoding)
+                        ;          MSAVE: new word - preserves R0 across BDOS in L_TRY loop
+                        ;
+                        ;        LINKER REQUIREMENTS (link99 v3.9.10+):
+                        ;          Fix 1: Phase 1 PREL - AORG modules (field>=PAGE_SEG) skip cmod add
+                        ;          Fix 2: Phase 2 PREL - AORG modules (field>=PAGE_SEG) skip cbase add
+                        ;          Fix 3: resolve() - subtract cbase from xrloc for buffer offset
+                        ;
+                        ;        BDOS CHANGES (BDOS57):
+                        ;          GETTYPE rewritten: EXE added (type 2), type numbering corrected
+                        ;          COM=1 EXE=2 TXT=3 BAS=4 PRO=5 - matches shell constants
+                        ;          Uses R5/R6 auto-increment pattern, GT_TAB replaces CHRT/CHRM/CHRS
+                        ;
                         ;*******************************************************************
                         
   0000                  R0	EQU	0
@@ -115,7 +149,7 @@
   10FF                  HALT:		EQU	10FFH
   0300                  COMM_BUF:	EQU	0300H		;COMMON BUFFER / LOADERCODE AREA
   0280                  COMM_FCB:	EQU	0280H
-  0280                  FCB:		EQU	COMM_FCB
+  0280                  FCB:	EQU	COMM_FCB
                         ;
                         ; SHELL ENTRY POINT
                         ;
@@ -137,46 +171,44 @@
   0100                  		BSS	32			;16 WORDS FOR XOP 0 WORKSPACE
                         
   0120                  	AORG	BDOS_XOP_E			;0x0120 - XOP 0 HANDLER
-  0120   2E8D           		WHEX	R13			;DEBUG - CALLER WP
-  0122   2E8E           		WHEX	R14			;DEBUG - CALLER PC
                         	;--- READ CALLER R2 (FUNCTION) AND R3 (PARAM) ---
-  0124   C0AD 0004      		MOV	@4(R13),R2		;CALLER R2 = BDOS FUNCTION CODE
-  0128   C0ED 0006      		MOV	@6(R13),R3		;CALLER R3 = BDOS PARAMETER
+  0120   C0AD 0004      		MOV	@4(R13),R2		;CALLER R2 = BDOS FUNCTION CODE
+  0124   C0ED 0006      		MOV	@6(R13),R3		;CALLER R3 = BDOS PARAMETER
                         	;--- SAVE CURRENT SEGMENT 13 PAGE MAPPING ---
-  012C   020C 80DC      		LI	R12,BDOS_CRU		;CRU ADDR FOR SEGMENT 13
-  0130   04C1           		CLR	R1
-  0132   3481           		STCR	R1,BYTEWIDE		;READ CURRENT PAGE INTO R1
-  0134   C201           		MOV	R1,R8			;SAVE IN R8 (OWN WORKSPACE)
+  0128   020C 80DC      		LI	R12,BDOS_CRU		;CRU ADDR FOR SEGMENT 13
+  012C   04C1           		CLR	R1
+  012E   3481           		STCR	R1,BYTEWIDE		;READ CURRENT PAGE INTO R1
+  0130   C201           		MOV	R1,R8			;SAVE IN R8 (OWN WORKSPACE)
                         	;--- MAP BDOS PAGE INTO SEGMENT 13 ---
-  0136   0201 000E      		LI	R1,BDOS_PAGE
+  0132   0201 000E      		LI	R1,BDOS_PAGE
                         		;LDCR writes from LSB - page number used directly
-  013A   3081           		LDCR	R1,BYTEWIDE		;PROGRAM SEGMENT 13 = BDOS PAGE
+  0136   3081           		LDCR	R1,BYTEWIDE		;PROGRAM SEGMENT 13 = BDOS PAGE
                         	;--- ENABLE PSEL ---
-  013C   0209 0100      		LI	R9,PSEL_EN
-  0140   2C89           		PSEL	R9
+  0138   0209 0100      		LI	R9,PSEL_EN
+  013C   2C89           		PSEL	R9
                         	;--- CALL BDOS ---
-  0142   2DA0 E000      		CALL	@BDOS_VIRT		;CALL INTO 0xD000
+  013E   2DA0 E000      		CALL	@BDOS_VIRT		;CALL INTO 0xD000
                         	;--- SAVE BDOS RESULT BEFORE RESTORING MAPPER ---
-  0146   C1C1           		MOV	R1,R7			;SAVE BDOS RESULT IN R7
+  0142   C1C1           		MOV	R1,R7			;SAVE BDOS RESULT IN R7
                         	;--- DISABLE PSEL TO SAFELY REPROGRAM MAPPER ---
-  0148   04C9           		CLR	R9
-  014A   2C89           		PSEL	R9
+  0144   04C9           		CLR	R9
+  0146   2C89           		PSEL	R9
                         	;--- RESTORE PREVIOUS SEGMENT 13 MAPPING ---
-  014C   C048           		MOV	R8,R1			;SAVED PAGE (ALREADY IN HIGH BYTE FROM STCR)
-  014E   020C 80DC      		LI	R12,BDOS_CRU
-  0152   3081           		LDCR	R1,BYTEWIDE		;RESTORE SEGMENT 13 (HIGH BYTE = PAGE)
+  0148   C048           		MOV	R8,R1			;SAVED PAGE (ALREADY IN HIGH BYTE FROM STCR)
+  014A   020C 80DC      		LI	R12,BDOS_CRU
+  014E   3081           		LDCR	R1,BYTEWIDE		;RESTORE SEGMENT 13 (HIGH BYTE = PAGE)
                         	;--- RE-ENABLE PSEL ---
-  0154   0209 0100      		LI	R9,PSEL_EN
-  0158   2C89           		PSEL	R9
+  0150   0209 0100      		LI	R9,PSEL_EN
+  0154   2C89           		PSEL	R9
                         	;--- PUT BDOS RETURN VALUE INTO CALLER R1 ---
-  015A   CB47 0002      		MOV	R7,@2(R13)		;R1 OF CALLER WORKSPACE = BDOS RESULT
+  0156   CB47 0002      		MOV	R7,@2(R13)		;R1 OF CALLER WORKSPACE = BDOS RESULT
                         	;--- RETURN FROM XOP ---
-  015E   0380           		RTWP
+  015A   0380           		RTWP
                         
   D000                  	AORG	SHELL
   D000   02E0 0230      	LWPI	WORKSP
   D004   020A 1000      	LI	SP,STACKP
-  D008   06A0 DE82      	BL	@MAP_INIT		;CLEAR ALL MAP REGISTERS TO PAGE 0
+  D008   06A0 E03C      	BL	@MAP_INIT		;CLEAR ALL MAP REGISTERS TO PAGE 0
   D00C   0460 D026      	B	@INIT
                         ;
                         ; LOW MEMORY EQUATES
@@ -209,8 +241,21 @@
   0042                  XOP0_PC:	EQU	0042H			;XOP 0 VECTOR - HANDLER PC
   0100                  BDOS_XWP:	EQU	0100H			;BDOS XOP WORKSPACE (32 BYTES)
   0120                  BDOS_XOP_E:	EQU	0120H			;BDOS XOP HANDLER ENTRY
-  0500                  STAGING:	EQU	0500H			;SECTOR STAGING BUFFER
-  02A0                  OVL_PRINT_VEC:	EQU	02A0H			;OVERLAY PRINT CALLBACK VECTOR (PAGE VARIABLES AREA)
+  0500                  STAGING:	EQU	0500H			;SECTOR STAGING BUFFER (COM LOADER)
+  0500                  EXE_STG:	EQU	0500H			;EXE LOADER STAGING BASE
+  0700                  EXE_STG2:	EQU	0700H			;EXE LOADER SECOND SECTOR
+  0900                  EXE_STG_END:	EQU	0900H			;EXE LOADER STAGING END (2 x 512 BYTES)
+  0700                  STAGING_END:	EQU	STAGING+512		;COM/DOLOAD STAGING END (1 x 512 BYTES)
+                        ;--- OVERLAY MANAGER PAGE VARIABLES (0x02A0-0x02FF) ---
+  02A0                  OVL_PRINT_VEC:	EQU	02A0H			; WORD: APPLICATION PRINT CALLBACK
+  02A2                  OVL_INIT_VEC:	EQU	02A2H			; WORD: ADDRESS OF OVLMGR_INIT
+  02A4                  OVL_SWAP_VEC:	EQU	02A4H			; WORD: ADDRESS OF OVLMGR
+  02A6                  OVL_COUNT:	EQU	02A6H			; WORD: NUMBER OF OVERLAYS REGISTERED BY LOADER
+  02A8                  OVL_CURR_ID:	EQU	02A8H			; WORD: CURRENTLY MAPPED OVLID (0=NONE)
+  02AA                  OVL_CURR_SEG:	EQU	02AAH			; WORD: CURRENTLY MAPPED SEGMENT
+  02AC                  OVL_PAGE_TAB:	EQU	02ACH			; 16 WORDS: PHYSICAL PAGE PER OVLID 1-16
+  02CC                  OVL_SEG_TAB:	EQU	02CCH			; 16 WORDS: VIRTUAL SEGMENT PER OVLID 1-16
+  0A00                  OVLMGR_BASE:	EQU	0A00H			; OVLMGR RESIDENT IN COMMON AT 0A00H
   1000                  FLATBASE:	EQU	1000H			;DEFAULT FLAT LOAD ADDRESS
                         
   0100                  IDE_BYTSEC:	EQU	256
@@ -247,6 +292,7 @@
                         ;
                         ; FILE TYPES
                         ;
+  0000                  SYS	EQU	0
   0001                  COM	EQU	1
   0002                  EXE	EQU	2
   0003                  TXT	EQU	3
@@ -284,8 +330,6 @@
   D023   2A             SYSFILE	BYTE	'*'
   D024   2B             DOSCMD	BYTE	'+'
   0000                  CONSOLE	EQU	0
-  0002                  EXEC	EQU	2
-  0005                  PROC	EQU	5
   0000                  DEFDRV	EQU	0
   D025   00             	EVEN
                         
@@ -298,7 +342,7 @@
                         
                         	;--- INIT 7 INTERRUPT VECTORS TO SAFE RTWP HANDLER ---
   D02E   0200 0230      	LI	R0,WORKSP		;WP FOR INTERRUPT HANDLER
-  D032   0201 DE1C      	LI	R1,INT_SAFE		;PC = SAFE RTWP HANDLER
+  D032   0201 DFD6      	LI	R1,INT_SAFE		;PC = SAFE RTWP HANDLER
   D036   0202 00B0      	LI	R2,00B0H		;FIRST INTERRUPT VECTOR
   D03A   0203 0007      	LI	R3,7			;7 VECTORS
   D03E   CC80           INIT_IV	MOV	R0,*R2+			;STORE WP
@@ -306,873 +350,1152 @@
   D042   0603           	DEC	R3
   D044   16FC           	JNE	INIT_IV
                         
-  D046   0201 0250      	LI	R1,CMDLINE
-  D04A   0202 DD14      	LI	R2,CMDLINE2
-  D04E   DC72           CMDLOOP:	MOVB	*R2+,*R1+
-  D050   16FE           	JNE	CMDLOOP
+                        	;--- INIT OVERLAY MANAGER ---
+                        	; Copy OVLMGR code to common at 0A00H, install vectors
+  D046   06A0 D4C8      	BL	@COPY_OVLMGR
+  D04A   04C0           	CLR	R0
+  D04C   C800 02A6      	MOV	R0,@OVL_COUNT
+  D050   C800 02A8      	MOV	R0,@OVL_CURR_ID
+  D054   C800 02AA      	MOV	R0,@OVL_CURR_SEG
                         
-  D052   D820 D018      	MOVB	@CR,@CMDLINE
-  D056   0250           
-  D058   0200 0250      	LI	R0,CMDLINE
-  D05C   C800 00A0      	MOV	R0,@CMDL_PTR
-  D060   04E0 00A2      	CLR	@CMDL_SIZE
-  D064   0200 0300      	LI	R0,COMM_BUF
-  D068   C800 00A4      	MOV	R0,@BUFF_PTR
-  D06C   0200 0280      	LI	R0,COMM_FCB
-  D070   C800 00AC      	MOV	R0,@FCB_PTR
+  D058   0201 0250      	LI	R1,CMDLINE
+  D05C   0202 DECE      	LI	R2,CMDLINE2
+  D060   DC72           CMDLOOP:	MOVB	*R2+,*R1+
+  D062   16FE           	JNE	CMDLOOP
                         
-  D074   0200 0460      INIT22	LI	R0,0460H
-  D078   0201 D4C2      	LI	R1,RETURN
-  D07C   C800 0080      	MOV	R0,@SHELL_PTR
-  D080   C801 0082      	MOV	R1,@SHELL_PTR+2
+  D064   D820 D018      	MOVB	@CR,@CMDLINE
+  D068   0250           
+  D06A   0200 0250      	LI	R0,CMDLINE
+  D06E   C800 00A0      	MOV	R0,@CMDL_PTR
+  D072   04E0 00A2      	CLR	@CMDL_SIZE
+  D076   0200 0300      	LI	R0,COMM_BUF
+  D07A   C800 00A4      	MOV	R0,@BUFF_PTR
+  D07E   0200 0280      	LI	R0,COMM_FCB
+  D082   C800 00AC      	MOV	R0,@FCB_PTR
                         
-  D084   0200 0460      	LI	R0,0460H
-  D088   0201 E400      	LI	R1,BDOS
-  D08C   C800 0084      	MOV	R0,@BDOS_PTR
-  D090   C801 0086      	MOV	R1,@BDOS_PTR+2
+  D086   0200 0460      INIT22	LI	R0,0460H
+  D08A   0201 D63A      	LI	R1,RETURN
+  D08E   C800 0080      	MOV	R0,@SHELL_PTR
+  D092   C801 0082      	MOV	R1,@SHELL_PTR+2
+                        
+  D096   0200 0460      	LI	R0,0460H
+  D09A   0201 E400      	LI	R1,BDOS
+  D09E   C800 0084      	MOV	R0,@BDOS_PTR
+  D0A2   C801 0086      	MOV	R1,@BDOS_PTR+2
                         
                         	;--- INSTALL BDOS SWAP XOP 0 AT 0x0040 ---
-  D094   0200 0100      	LI	R0,BDOS_XWP			;WORKSPACE ADDRESS IN COMMON
-  D098   C800 0040      	MOV	R0,@XOP0_WP			;XOP 0 WORKSPACE POINTER
-  D09C   0200 0120      	LI	R0,BDOS_XOP_E			;HANDLER ADDRESS IN COMMON
-  D0A0   C800 0042      	MOV	R0,@XOP0_PC			;XOP 0 PC POINTER
+  D0A6   0200 0100      	LI	R0,BDOS_XWP			;WORKSPACE ADDRESS IN COMMON
+  D0AA   C800 0040      	MOV	R0,@XOP0_WP			;XOP 0 WORKSPACE POINTER
+  D0AE   0200 0120      	LI	R0,BDOS_XOP_E			;HANDLER ADDRESS IN COMMON
+  D0B2   C800 0042      	MOV	R0,@XOP0_PC			;XOP 0 PC POINTER
                         
-  D0A4   0200 0500      	LI	R0,TPA
-  D0A8   C800 00A6      	MOV	R0,@FREEMEM
-  D0AC   0200 D000      	LI	R0,SHELL
-  D0B0   C800 00B0      	MOV	R0,@MEMLIMIT
+  D0B6   0200 0500      	LI	R0,TPA
+  D0BA   C800 00A6      	MOV	R0,@FREEMEM
+  D0BE   0200 D000      	LI	R0,SHELL
+  D0C2   C800 00B0      	MOV	R0,@MEMLIMIT
                         
-  D0B4   2FA0 DD74      	MESG	@SINON
+  D0C6   2FA0 DF2E      	MESG	@SINON
                         
                         ;*******************************************************************
                         ;	DOCMD - process next shell command
                         ;*******************************************************************
-  D0B8   C020 DD08      DOCMD	MOV	@SKIPSW,R0
-  D0BC   04E0 DD08      	CLR	@SKIPSW
-  D0C0   C000           	MOV	R0,R0
-  D0C2   1617           	JNE	DOCMD2A
-  D0C4   0203 0250      	LI	R3,CMDLINE
-  D0C8   04C1           	CLR	R1
-  D0CA   D053           	MOVB	*R3,R1
-  D0CC   9801 D018      	CB	R1,@CR
-  D0D0   1310           	JEQ	DOCMD2A
+  D0CA   C020 DEC2      DOCMD	MOV	@SKIPSW,R0
+  D0CE   04E0 DEC2      	CLR	@SKIPSW
+  D0D2   C000           	MOV	R0,R0
+  D0D4   1617           	JNE	DOCMD2A
+  D0D6   0203 0250      	LI	R3,CMDLINE
+  D0DA   04C1           	CLR	R1
+  D0DC   D053           	MOVB	*R3,R1
+  D0DE   9801 D018      	CB	R1,@CR
+  D0E2   1310           	JEQ	DOCMD2A
                         
-  D0D2   0281 0000      CHKSYS	CI	R1,0
-  D0D6   1602           	JNE	DOCMD1
-  D0D8   0460 DB92      	B	@CMDERR
+  D0E4   0281 0000      CHKSYS	CI	R1,0
+  D0E8   1602           	JNE	DOCMD1
+  D0EA   0460 DD4C      	B	@CMDERR
                         
-  D0DC   9801 D011      DOCMD1	CB	R1,@CTLX
-  D0E0   1602           	JNE	DOCMDAA
-  D0E2   0420 F004      	BLWP	@BANNER
-  D0E6   9801 D013      DOCMDAA	CB	R1,@CTLY
-  D0EA   1600           	JNE	DOCMD2
+  D0EE   9801 D011      DOCMD1	CB	R1,@CTLX
+  D0F2   1602           	JNE	DOCMDAA
+  D0F4   0420 F004      	BLWP	@BANNER
+  D0F8   9801 D013      DOCMDAA	CB	R1,@CTLY
+  D0FC   1600           	JNE	DOCMD2
                         
-  D0EC   9801 D015      DOCMD2	CB	R1,@SPACE
-  D0F0   1B02           	JH	DOCMD4
+  D0FE   9801 D015      DOCMD2	CB	R1,@SPACE
+  D102   1B02           	JH	DOCMD4
                         
-  D0F2   0460 D4EE      DOCMD2A	B	@NEXTCMD
+  D104   0460 D666      DOCMD2A	B	@NEXTCMD
                         
-  D0F6   9801 D01D      DOCMD4	CB	R1,@JUMP
-  D0FA   1607           	JNE	DOCMD3
-  D0FC   0203 0251      	LI	R3,CMDLINE+1
-  D100   9813 D015      	CB	*R3,@SPACE
-  D104   1B07           	JH	LOOK
-  D106   0460 D2DE      	B	@GOPROG
+  D108   9801 D01D      DOCMD4	CB	R1,@JUMP
+  D10C   1607           	JNE	DOCMD3
+  D10E   0203 0251      	LI	R3,CMDLINE+1
+  D112   9813 D015      	CB	*R3,@SPACE
+  D116   1B07           	JH	LOOK
+  D118   0460 D31A      	B	@GOPROG
                         
-  D10A   9801 D024      DOCMD3	CB	R1,@DOSCMD
-  D10E   1602           	JNE	LOOK
-  D110   0460 D4C2      DOCMD9	B	@RETURN
+  D11C   9801 D024      DOCMD3	CB	R1,@DOSCMD
+  D120   1602           	JNE	LOOK
+  D122   0460 D63A      DOCMD9	B	@RETURN
                         
                         ;*******************************************************************
                         ;	LOOK - look up named file
                         ;*******************************************************************
-  D114   2DA0 D1BA      LOOK:	CALL	@PARSENAME
-  D118   2DA0 D5C2      	CALL	@ICMD
-  D11C   2DA0 D1B4      	CALL	@SEG_SWITCH
+  D126   2DA0 D1C2      LOOK:	CALL	@PARSENAME
+  D12A   2DA0 D73A      	CALL	@ICMD
+  D12E   2DA0 D1BC      	CALL	@SEG_SWITCH
+                        ;CHECK IF JUST FILE NAME TYPES IN
+  D132   9820 0288      	CB	@FCB+EXTOFF,@SPACE
+  D136   D015           
+  D138   1608           	JNE	L_START
+                        ;YES ADD WILD CARD
+  D13A   0200 3F00      	LI	R0,'?'*256 ;EXT_TAB
+  D13E   D800 0288      L_TRY:	MOVB	R0,@FCB+EXTOFF
+  D142   D800 0289      	MOVB	R0,@FCB+EXTOFF+1
+  D146   D800 028A      	MOVB	R0,@FCB+EXTOFF+2
                         
-  D120   9820 0288      	CB	@FCB+EXTOFF,@SPACE
-  D124   D015           
-  D126   1608           	JNE	L_START
+  D14A   2E00           L_START:	PUSH	R0		; SAVE R0 - BDOS CLOBBERS IT
+  D14C   0203 0280      	LI	R3,FCB
+  D150   0202 0011      	LI	R2,SEARCH1
+  D154   2DA0 E400      	CALL	@BDOS
+  D158   2E40           	POP	R0		; RESTORE R0
+  D15A   C041           	MOV	R1,R1
+  D15C   1404           	JHE	L_FOUND
                         
-  D128   0200 D1EC      	LI	R0,EXT_TAB
-  D12C   D830 0288      L_TRY:	MOVB	*R0+,@FCB+EXTOFF
-  D130   D830 0289      	MOVB	*R0+,@FCB+EXTOFF + 1
-  D134   D830 028A      	MOVB	*R0+,@FCB+EXTOFF + 2
+  D15E   D050           	MOVB	*R0,R1		; PEEK AT NEXT ENTRY - SETS CC
+  D160   16EE           	JNE	L_TRY
                         
-  D138   0203 0280      L_START:	LI	R3,FCB
-  D13C   0202 0011      	LI	R2,SEARCH1
-  D140   2DA0 E400      	CALL	@BDOS
-  D144   C041           	MOV	R1,R1
-  D146   1408           	JHE	L_FOUND
+  D162   0460 DD4C      LOOKERR:	B	@CMDERR
                         
-  D148   9820 0288      	CB	@FCB+EXTOFF,@SPACE
-  D14C   D015           
-  D14E   0280 D1F8      	CI	R0,EXT_END
-  D152   1AEC           	JL	L_TRY
-                        
-  D154   0460 DB92      LOOKERR:	B	@CMDERR
-                        
-  D158   0202 000F      L_FOUND:	LI	R2,FOPEN
-  D15C   0203 0280      	LI	R3,FCB
-  D160   2DA0 E400      	CALL	@BDOS
-  D164   C041           	MOV	R1,R1
-  D166   11F6           	JLT	LOOKERR
-  D168   0204 0280      	LI	R4,FCB
-  D16C   C824 000E      	MOV	@FSZ(R4),@MFSZ
-  D170   DD66           
-  D172   D824 000B      	MOVB	@FTY(R4),@MFTY
-  D176   DD64           
-  D178   0460 D21C      	B	@LOAD
+  D166   0202 000F      L_FOUND:	LI	R2,FOPEN
+  D16A   0203 0280      	LI	R3,FCB
+  D16E   2DA0 E400      	CALL	@BDOS
+  D172   C041           	MOV	R1,R1
+  D174   11F6           	JLT	LOOKERR
+  D176   0204 0280      	LI	R4,FCB
+  D17A   C824 000E      	MOV	@FSZ(R4),@MFSZ
+  D17E   DF20           
+                        ;	CALL	@SET_FTY			; DERIVE FTY FROM EXTENSION
+  D180   0460 D258      	B	@LOAD
                         
                         ;*******************************************************************
                         ;	PADSPACE - R2=count, R4=destination
                         ;*******************************************************************
-  D17C   C082           PADSPACE:	MOV	R2,R2
-  D17E   1204           	JLE	PADRETS
-  D180   DD20 D015      PADLOOP:	MOVB	@SPACE,*R4+
-  D184   0602           	DEC	R2
-  D186   1BFC           	JH	PADLOOP
-  D188   2DC0           PADRETS:	RET
+  D184   C082           PADSPACE:	MOV	R2,R2
+  D186   1204           	JLE	PADRETS
+  D188   DD20 D015      PADLOOP:	MOVB	@SPACE,*R4+
+  D18C   0602           	DEC	R2
+  D18E   1BFC           	JH	PADLOOP
+  D190   2DC0           PADRETS:	RET
                         
                         ;*******************************************************************
                         ;	CHKCHAR - check if char at *R3 is valid filename char
                         ;*******************************************************************
-  D18A   D053           CHKCHAR:	MOVB	*R3,R1
-  D18C   0981           	SRL	R1,8
-  D18E   0281 0030      	CI	R1,'0'
-  D192   1A0C           	JL	INVALID
-  D194   0281 0039      	CI	R1,'9'
-  D198   1207           	JLE	VALID
-  D19A   0241 00DF      	ANDI	R1,00DFH
-  D19E   0221 FFBF      	AI	R1,-'A'
-  D1A2   0281 001A      	CI	R1,001AH
-  D1A6   1B02           	JH	INVALID
-  D1A8   04C1           VALID:	CLR	R1
-  D1AA   1002           	JMP	SETFLAG
-  D1AC   0201 0001      INVALID:	LI	R1,1
-  D1B0   C041           SETFLAG:	MOV	R1,R1
-  D1B2   2DC0           	RET
+  D192   D053           CHKCHAR:	MOVB	*R3,R1
+  D194   0981           	SRL	R1,8
+  D196   0281 0030      	CI	R1,'0'
+  D19A   1A0C           	JL	INVALID
+  D19C   0281 0039      	CI	R1,'9'
+  D1A0   1207           	JLE	VALID
+  D1A2   0241 00DF      	ANDI	R1,00DFH
+  D1A6   0221 FFBF      	AI	R1,-'A'
+  D1AA   0281 001A      	CI	R1,001AH
+  D1AE   1B02           	JH	INVALID
+  D1B0   04C1           VALID:	CLR	R1
+  D1B2   1002           	JMP	SETFLAG
+  D1B4   0201 0001      INVALID:	LI	R1,1
+  D1B8   C041           SETFLAG:	MOV	R1,R1
+  D1BA   2DC0           	RET
                         
                         ;*******************************************************************
                         ;	SEG_SWITCH - deprecated v5.4 (transparent GAL mapping)
                         ;*******************************************************************
-  D1B4   2DC0           SEG_SWITCH:	RET
+  D1BC   2DC0           SEG_SWITCH:	RET
                         
-  D1B6   0460 D6B2      SSWERR:	B	@PARSERR
+  D1BE   0460 D82A      SSWERR:	B	@PARSERR
                         
                         ;*******************************************************************
                         ;	PARSENAME - parse filename from command line into FCB
                         ;*******************************************************************
-  D1BA   0204 0280      PARSENAME:	LI	R4,FCB
-  D1BE   0202 0008      	LI	R2,NAMSIZ - EXTSIZ
-  D1C2   04C0           	CLR	R0
+  D1C2   0204 0280      PARSENAME:	LI	R4,FCB
+  D1C6   0202 0008      	LI	R2,NAMSIZ - EXTSIZ
+  D1CA   04C0           	CLR	R0
                         
-  D1C4   2DA0 D18A      PARSE1:	CALL	@CHKCHAR
-  D1C8   1604           	JNE	FILLNAME
-  D1CA   DD33           	MOVB	*R3+,*R4+
-  D1CC   0602           	DEC	R2
-  D1CE   1303           	JEQ	FINDDOT
-  D1D0   10F9           	JMP	PARSE1
+  D1CC   2DA0 D192      PARSE1:	CALL	@CHKCHAR
+  D1D0   1604           	JNE	FILLNAME
+  D1D2   DD33           	MOVB	*R3+,*R4+
+  D1D4   0602           	DEC	R2
+  D1D6   1303           	JEQ	FINDDOT
+  D1D8   10F9           	JMP	PARSE1
                         
-  D1D2   2DA0 D17C      FILLNAME:	CALL	@PADSPACE
+  D1DA   2DA0 D184      FILLNAME:	CALL	@PADSPACE
                         
-  D1D6   9833 D01F      FINDDOT:	CB	*R3+,@EXT
-  D1DA   130F           	JEQ	GETEXT
-  D1DC   0603           	DEC	R3
-  D1DE   0202 0003      	LI	R2,EXTSIZ
-  D1E2   0204 0288      	LI	R4,FCB + NAMSIZ - EXTSIZ
-  D1E6   2DA0 D17C      	CALL	@PADSPACE
-  D1EA   2DC0           	RET
+  D1DE   9833 D01F      FINDDOT:	CB	*R3+,@EXT
+  D1E2   130F           	JEQ	GETEXT
+  D1E4   0603           	DEC	R3
+  D1E6   0202 0003      	LI	R2,EXTSIZ
+  D1EA   0204 0288      	LI	R4,FCB + NAMSIZ - EXTSIZ
+  D1EE   2DA0 D184      	CALL	@PADSPACE
+  D1F2   2DC0           	RET
                         
-  D1EC   434F 4D42      EXT_TAB:	TEXT	'COMBASBAT'
-  D1F0   4153 4241      
-  D1F4   54             
-  D1F5   54             CHRT:	BYTE	'T'
-  D1F6   4D             CHRM:	BYTE	'M'
-  D1F7   53             CHRS:	BYTE	'S'
-  D1F8   00             EXT_END:	BYTE	0
-  D1F9   00             	EVEN
+  D1F4   434F 4D        EXT_TAB:	TEXT	'COM'
+  D1F7   4558 45        	TEXT	'EXE'
+  D1FA   4241 53        	TEXT	'BAS'
+  D1FD   4241 54        	TEXT	'BAT'
+  D200   00             EXT_END:	BYTE	0
+  D201   00             	EVEN
                         
-  D1FA   0202 0003      GETEXT:	LI	R2,EXTSIZ
-  D1FE   0204 0288      	LI	R4,FCB + NAMSIZ - EXTSIZ
-  D202   2DA0 D18A      NEXTEXT:	CALL	@CHKCHAR
-  D206   1607           	JNE	FILLEXT
-  D208   D073           	MOVB	*R3+,R1
-  D20A   0241 DF00      	ANDI	R1,0DF00H
-  D20E   DD01           	MOVB	R1,*R4+
-  D210   0602           	DEC	R2
-  D212   1301           	JEQ	FILLEXT
-  D214   10F6           	JMP	NEXTEXT
-  D216   2DA0 D17C      FILLEXT:	CALL	@PADSPACE
-  D21A   2DC0           	RET
+  D202   0202 0003      GETEXT:	LI	R2,EXTSIZ
+  D206   0204 0288      	LI	R4,FCB + NAMSIZ - EXTSIZ
+  D20A   2DA0 D192      NEXTEXT:	CALL	@CHKCHAR
+  D20E   1607           	JNE	FILLEXT
+  D210   D073           	MOVB	*R3+,R1
+  D212   0241 DF00      	ANDI	R1,0DF00H
+  D216   DD01           	MOVB	R1,*R4+
+  D218   0602           	DEC	R2
+  D21A   1301           	JEQ	FILLEXT
+  D21C   10F6           	JMP	NEXTEXT
+  D21E   2DA0 D184      FILLEXT:	CALL	@PADSPACE
+  D222   2DC0           	RET
                         
                         ;*******************************************************************
+                        ;	SET_FTY - derive file type from FCB extension, store in MFTY
+                        ;	FCB is absolute at 0280H - @FCB+EXTOFF etc are plain address constants
+                        ;	Uses R5 (table base), R6 (entry walk), R7 (type counter), R0 (scratch)
+                        ;
+                        SET_FTY:
+  D224   0205 D1F4      	LI	R5,EXT_TAB			; TABLE BASE
+  D228   04C7           	CLR	R7				; TYPE CODE (0=SYS)
+                        SFTY_LOOP:
+  D22A   C185           	MOV	R5,R6				; R6 = ENTRY WALK POINTER
+  D22C   D036           	MOVB	*R6+,R0				; BYTE 1
+  D22E   130F           	JEQ	SFTY_NONE			; END OF TABLE
+  D230   0587           	INC	R7				; NEXT TYPE CODE
+  D232   9800 0288      	CB	R0,@FCB+EXTOFF			; COMPARE BYTE 1
+  D236   1608           	JNE	SFTY_NEXT
+  D238   D036           	MOVB	*R6+,R0				; BYTE 2
+  D23A   9800 0289      	CB	R0,@FCB+EXTOFF+1		; COMPARE BYTE 2
+  D23E   1604           	JNE	SFTY_NEXT
+  D240   D016           	MOVB	*R6,R0				; BYTE 3
+  D242   9800 028A      	CB	R0,@FCB+EXTOFF+2		; COMPARE BYTE 3
+  D246   1304           	JEQ	SFTY_FOUND
+                        SFTY_NEXT:
+  D248   0225 0003      	AI	R5,3				; NEXT ENTRY
+  D24C   10EE           	JMP	SFTY_LOOP
+                        SFTY_NONE:
+  D24E   04C7           	CLR	R7				; NO MATCH - SYS=0
+                        SFTY_FOUND:
+  D250   06C7           	SWPB	R7				; TYPE TO HIGH BYTE FOR MOVB
+  D252   D807 DF1E      	MOVB	R7,@MFTY			; STORE TYPE CODE
+  D256   2DC0           	RET
+                        ;
                         ;	LOAD - load executable file
                         ;
                         ;	FLA in FCB gives load address (0 = use TPA).
                         ;	'.' prefix = flat load only, no execution, returns to prompt.
                         ;	COM/EXE/type 0 = LOADERCODE (handles paged and raw binaries).
                         ;*******************************************************************
-  D21C   04C1           LOAD:	CLR	R1
-  D21E   D801 024E      	MOVB	R1,@CMDLINE-2
-  D222   0204 0280      	LI	R4,FCB
-  D226   C0E4 0010      	MOV	@FLA(R4),R3
-  D22A   1602           	JNE	LOAD2
-  D22C   0203 0500      	LI	R3,TPA
-  D230   C803 DD10      LOAD2	MOV	R3,@LADDR
-  D234   04E4 001A      	CLR	@CRN(R4)
+  D258   04C1           LOAD:	CLR	R1
+  D25A   D801 024E      	MOVB	R1,@CMDLINE-2
+  D25E   0204 0280      	LI	R4,FCB
+  D262   C0E4 0010      	MOV	@FLA(R4),R3
+  D266   1602           	JNE	LOAD2
+  D268   0203 0500      	LI	R3,TPA
+  D26C   C803 DECA      LOAD2	MOV	R3,@LADDR
+  D270   04E4 001A      	CLR	@CRN(R4)
                         
-  D238   9820 0250      	CB	@CMDLINE,@JUMP
-  D23C   D01D           
-  D23E   1617           	JNE	LOADRUN
-  D240   064A           LOADF3	DECT	SP
-  D242   C683           	MOV	R3,*SP
-  D244   0202 001A      LOADF0	LI	R2,SETDMA
-  D248   2DA0 E400      	CALL	@BDOS
-  D24C   0202 0014      	LI	R2,RDSEQ
-  D250   0203 0280      	LI	R3,FCB
-  D254   2DA0 E400      	CALL	@BDOS
-  D258   C0FA           	MOV	*SP+,R3
-  D25A   0281 FFFF      	CI	R1,-1
-  D25E   1303           	JEQ	LOADF1
-  D260   0223 0200      	AI	R3,BLKSIZ
-  D264   10ED           	JMP	LOADF3
-  D266   C803 00A6      LOADF1	MOV	R3,@FREEMEM
-  D26A   0460 D4EE      	B	@NEXTCMD
+  D274   9820 0250      	CB	@CMDLINE,@JUMP
+  D278   D01D           
+  D27A   1617           	JNE	LOADRUN
+  D27C   064A           LOADF3	DECT	SP
+  D27E   C683           	MOV	R3,*SP
+  D280   0202 001A      LOADF0	LI	R2,SETDMA
+  D284   2DA0 E400      	CALL	@BDOS
+  D288   0202 0014      	LI	R2,RDSEQ
+  D28C   0203 0280      	LI	R3,FCB
+  D290   2DA0 E400      	CALL	@BDOS
+  D294   C0FA           	MOV	*SP+,R3
+  D296   0281 FFFF      	CI	R1,-1
+  D29A   1303           	JEQ	LOADF1
+  D29C   0223 0200      	AI	R3,BLKSIZ
+  D2A0   10ED           	JMP	LOADF3
+  D2A2   C803 00A6      LOADF1	MOV	R3,@FREEMEM
+  D2A6   0460 D666      	B	@NEXTCMD
                         
                         LOADRUN:
-  D26E   D060 DD64      	MOVB	@MFTY,R1
-  D272   0981           	SRL	R1,8
-  D274   0281 0001      	CI	R1,COM
-  D278   1602           	JNE	LT2
-  D27A   0460 D2DE      	B	@GOPROG
-  D27E   0281 0002      LT2	CI	R1,EXE
-  D282   1602           	JNE	LT3
-  D284   0460 D2DE      	B	@GOPROG
-  D288   0281 0000      LT3	CI	R1,0
-  D28C   1602           	JNE	LT4
-  D28E   0460 D2DE      	B	@GOPROG
+  D2AA   D064 000B      	MOVB	@FTY(R4),R1
+  D2AE   0981           	SRL	R1,8
+  D2B0   0281 0001      	CI	R1,COM
+  D2B4   1602           	JNE	LT2
+  D2B6   0460 D31A      	B	@GOPROG
+  D2BA   0281 0002      LT2	CI	R1,EXE
+  D2BE   1602           	JNE	LT3
+  D2C0   0460 D34E      	B	@GOPROG_EXE		;EXE - PAGED CHAIN FORMAT
+                        ;
+                        ;IS THIS CODE REDUNDANT?  E TO DO TO DO
+                        ;
+                        LT3	;B	@NEXTCMD
+                        
+  D2C4   0281 0000      	CI	R1,0
+  D2C8   1602           	JNE	LT4
+  D2CA   0460 D31A      	B	@GOPROG
                         LT4
-  D292   04E4 001A      	CLR	@CRN(R4)
-  D296   064A           LOAD3	DECT	SP
-  D298   C683           	MOV	R3,*SP
-  D29A   0202 001A      LOAD0	LI	R2,SETDMA
-  D29E   2DA0 E400      	CALL	@BDOS
-  D2A2   0202 0014      	LI	R2,RDSEQ
-  D2A6   0203 0280      	LI	R3,FCB
-  D2AA   2DA0 E400      	CALL	@BDOS
-  D2AE   C0FA           	MOV	*SP+,R3
-  D2B0   0281 FFFF      	CI	R1,-1
-  D2B4   1303           	JEQ	LOAD1
-  D2B6   0223 0200      	AI	R3,BLKSIZ
-  D2BA   10ED           	JMP	LOAD3
-  D2BC   C803 00A6      LOAD1	MOV	R3,@FREEMEM
-  D2C0   D060 DD64      	MOVB	@MFTY,R1
-  D2C4   0981           	SRL	R1,8
-  D2C6   0281 0005      	CI	R1,PROC
-  D2CA   1602           	JNE	LOAD1B
-  D2CC   0460 D4EE      	B	@NEXTCMD
-  D2D0   0281 0003      LOAD1B	CI	R1,TXT
-  D2D4   1602           	JNE	LOAD1C
-  D2D6   0460 D4EE      	B	@NEXTCMD
-  D2DA   0460 D4EE      LOAD1C	B	@NEXTCMD
+  D2CE   04E4 001A      	CLR	@CRN(R4)
+  D2D2   064A           LOAD3	DECT	SP
+  D2D4   C683           	MOV	R3,*SP
+  D2D6   0202 001A      LOAD0	LI	R2,SETDMA
+  D2DA   2DA0 E400      	CALL	@BDOS
+  D2DE   0202 0014      	LI	R2,RDSEQ
+  D2E2   0203 0280      	LI	R3,FCB
+  D2E6   2DA0 E400      	CALL	@BDOS
+  D2EA   C0FA           	MOV	*SP+,R3
+  D2EC   0281 FFFF      	CI	R1,-1
+  D2F0   1303           	JEQ	LOAD1
+  D2F2   0223 0200      	AI	R3,BLKSIZ
+  D2F6   10ED           	JMP	LOAD3
+  D2F8   C803 00A6      LOAD1	MOV	R3,@FREEMEM
+  D2FC   D060 DF1E      	MOVB	@MFTY,R1
+  D300   0981           	SRL	R1,8
+  D302   0281 0005      	CI	R1,PRO
+  D306   1602           	JNE	LOAD1B
+  D308   0460 D666      	B	@NEXTCMD
+  D30C   0281 0003      LOAD1B	CI	R1,TXT
+  D310   1602           	JNE	LOAD1C
+  D312   0460 D666      	B	@NEXTCMD
+  D316   0460 D666      LOAD1C	B	@NEXTCMD
                         
                         ;*******************************************************************
                         ;	GOPROG - run loaded program via LOADERCODE
                         ;*******************************************************************
-  D2DE   0204 0250      GOPROG	LI	R4,CMDLINE
-  D2E2   0584           GOLOOP	INC	R4
-  D2E4   9814 D015      	CB	*R4,@SPACE
-  D2E8   1BFC           	JH	GOLOOP
-  D2EA   04C1           	CLR	R1
-  D2EC   D801 024F      	MOVB	R1,@CMDLINE-1
-  D2F0   0200 0080      	LI	R0,SHELL_PTR
-  D2F4   064A           	DECT	SP
-  D2F6   C680           	MOV	R0,*SP
-  D2F8   2DA0 D300      	CALL	@INIT_LOADER
-  D2FC   0460 0300      	B	@LOADER
+  D31A   0204 0250      GOPROG	LI	R4,CMDLINE
+  D31E   0584           GOLOOP	INC	R4
+  D320   9814 D015      	CB	*R4,@SPACE
+  D324   1BFC           	JH	GOLOOP
+  D326   04C1           	CLR	R1
+  D328   D801 024F      	MOVB	R1,@CMDLINE-1
+  D32C   0200 0080      	LI	R0,SHELL_PTR
+  D330   064A           	DECT	SP
+  D332   C680           	MOV	R0,*SP
+  D334   2DA0 D33C      	CALL	@INIT_LOADER
+  D338   0460 0300      	B	@LOADER
                         
                         ;*******************************************************************
                         ;	INIT_LOADER - copy LOADERCODE to LOADER (0x0300)
                         ;*******************************************************************
-  D300   0202 0300      INIT_LOADER:	LI	R2,LOADER
-  D304   0201 D312      	LI	R1,LOADERCODE
-  D308   CCB1           IL0:	MOV	*R1+,*R2+
-  D30A   0281 D4C2      	CI	R1,END_LOADER
-  D30E   1AFC           	JL	IL0
-  D310   2DC0           	RET
+  D33C   0202 0300      INIT_LOADER:	LI	R2,LOADER
+  D340   0201 D53C      	LI	R1,LOADERCODE
+  D344   CCB1           IL0:	MOV	*R1+,*R2+
+  D346   0281 D60A      	CI	R1,END_LOADER
+  D34A   1AFC           	JL	IL0
+  D34C   2DC0           	RET
                         
                         ;*******************************************************************
-                        ;  LOADERCODE v5.6
+                        ;	GOPROG_EXE - stub for paged EXE chain format (v5.7)
+                        ;	Called when file type is EXE. Returns to caller.
+                        ;	Full implementation pending BDOS EXE type verification.
+                        ;*******************************************************************
+                        ;*******************************************************************
+                        ;	GOPROG_EXE - run EXE (paged chain format) via LOADERCODE_EXE
+                        ;*******************************************************************
+                        GOPROG_EXE:
+  D34E   0204 0250      	LI	R4,CMDLINE
+                        GOLOOP_E:
+  D352   0584           	INC	R4
+  D354   9814 D015      	CB	*R4,@SPACE
+  D358   1BFC           	JH	GOLOOP_E
+  D35A   04C1           	CLR	R1
+  D35C   D801 024F      	MOVB	R1,@CMDLINE-1
+  D360   0200 0080      	LI	R0,SHELL_PTR
+  D364   064A           	DECT	SP
+  D366   C680           	MOV	R0,*SP
+  D368   2DA0 D370      	CALL	@INIT_LOADER_EXE
+  D36C   0460 0300      	B	@LOADER
+                        
+                        ;*******************************************************************
+                        ;	INIT_LOADER_EXE - copy LOADERCODE_EXE to LOADER (0x0300)
+                        ;*******************************************************************
+                        INIT_LOADER_EXE:
+  D370   0202 0300      	LI	R2,LOADER
+  D374   0201 D382      	LI	R1,LOADERCODE_EXE
+  D378   CCB1           ILE0:	MOV	*R1+,*R2+
+  D37A   0281 D4C8      	CI	R1,END_LOADER_EXE
+  D37E   1AFC           	JL	ILE0
+  D380   2DC0           	RET
+                        
+                        ;*******************************************************************
+                        ;  LOADERCODE_EXE v5.7
                         ;
-                        ;  Copied to LOADER (0x0300) by INIT_LOADER, runs from COMMON.
+                        ;  Copied to LOADER (0x0300) by INIT_LOADER_EXE. Runs from COMMON.
                         ;
-                        ;  STAGING buffer: 0x0500, 512 bytes, always in common memory.
-                        ;  First sector always read to STAGING for format detection.
-                        ;  LADDR: FCB load address - used only for raw binary.
+                        ;  Reads .EXE paged chain format produced by link99 v3.9.10.
                         ;
-                        ;  File format detection (first word of staging buffer):
-                        ;    FFFF = link99 format:
-                        ;           FFFF FFFF FFFF   opening sentinel
-                        ;           start end page   pagemap entry (one entry for now)
-                        ;           FFFF FFFF FFFF   closing sentinel
-                        ;           size data...     one block
-                        ;    else = raw binary: load flat to LADDR, launch from LADDR
+                        ;  Block header (8 bytes):
+                        ;    +0  next_offset  word  byte distance from THIS header to next (0=last)
+                        ;    +2  page         word  physical page (0=common/flat)
+                        ;    +4  start        word  virtual load address
+                        ;    +6  size         word  byte count of data following header
+                        ;    +8  [data...]
                         ;
-                        ;  Paged load sequence:
-                        ;    1. Clear all map registers to page 0
-                        ;    2. Read first sector to STAGING
-                        ;    3. Detect format
-                        ;    4. Walk pagemap entries, call MAP_SET for each segment
-                        ;    5. Enable PSEL once after all MAP_SET calls
-                        ;    6. Copy block to destination (LDRCPY/LDRSEC)
-                        ;    7. Launch from R8 (first pagemap entry start)
+                        ;  Single forward pass:
+                        ;    R6 -> header. Save R7=R6 (header start). Consume 4 words.
+                        ;    Capture R8 from first block start only.
+                        ;    MAP_SET if page != 0.
+                        ;    PSEL on. Copy size bytes from R6 to start. PSEL off.
+                        ;    If next_offset == 0 -> LDRRUN (launch).
+                        ;    R6 = R7 + next_offset. Loop.
+                        ;    Sector reload (LDRSEC_E) preserves R5/R7/R8 across BDOS.
+                        ;    After reload R6 = STAGING + (old R6 - STAGING end).
+                        ;
+                        ;  Branches to LDRRUN/LDRRUN_LOAD/LDRERR in shell (always resident).
                         ;
                         ;  Key registers:
-                        ;    R1   source in STAGING (reset each sector reload)
-                        ;    R2   paged destination (walks continuously)
-                        ;    R3   words remaining (saved/restored across BDOS via stack)
-                        ;    R4   end of STAGING = 0x0700
-                        ;    R6   walks STAGING: pagemap then block data
-                        ;    R7   segment walker in LDRSEG
-                        ;    R8   launch address (first pagemap entry start)
+                        ;    R2   paged destination (start address, reset each block)
+                        ;    R3   word count (saved across BDOS)
+                        ;    R4   end of STAGING = EXE_STG_END
+                        ;    R5   next_offset (saved across block copy and BDOS)
+                        ;    R6   current STAGING pointer (header then data)
+                        ;    R7   header start (for next_offset arithmetic)
+                        ;    R8   launch address (first block start, never changed after)
                         ;    R9   scratch / PSEL value
+                        ;*******************************************************************
+                        
+                        LOADERCODE_EXE:
+                        
+                        ;--- CLEAR ALL MAP REGISTERS TO PAGE 0 ---
+  D382   020C 80C0      	LI	R12,MAP_WIN_BASE
+  D386   04C0           	CLR	R0
+  D388   0201 0010      	LI	R1,NUM_SEGS
+                        LDRCL_E:
+  D38C   3080           	LDCR	R0,BYTEWIDE
+  D38E   05CC           	INCT	R12
+  D390   0601           	DEC	R1
+  D392   16FC           	JNE	LDRCL_E
+                        
+                        ;--- READ TWO SECTORS TO STAGING (EXE_STG to EXE_STG_END) ---
+                        ; Two sectors avoids mid-block reload, keeping chain arithmetic valid.
+  D394   04C0           	CLR	R0
+  D396   0203 0500      	LI	R3,EXE_STG
+  D39A   0202 001A      	LI	R2,SETDMA
+  D39E   2DA0 E400      	CALL	@BDOS
+  D3A2   0202 0014      	LI	R2,RDSEQ
+  D3A6   0203 0280      	LI	R3,FCB
+  D3AA   2DA0 E400      	CALL	@BDOS
+  D3AE   0281 FFFF      	CI	R1,-1
+  D3B2   1602           	JNE	LDREDET_E
+  D3B4   0460 D60A      	B	@LDRRUN			;EMPTY FILE
+                        LDREDET_E:
+  D3B8   C041           	MOV	R1,R1
+  D3BA   1101           	JLT	LDRERR_B
+  D3BC   1002           	JMP	LDREDET_OK
+                        LDRERR_B:
+  D3BE   0460 D5E2      	B	@LDRERR
+                        LDREDET_OK:
+                        	;--- READ SECOND SECTOR TO EXE_STG2 ---
+  D3C2   0203 0700      	LI	R3,EXE_STG2
+  D3C6   0202 001A      	LI	R2,SETDMA
+  D3CA   2DA0 E400      	CALL	@BDOS
+  D3CE   0202 0014      	LI	R2,RDSEQ
+  D3D2   0203 0280      	LI	R3,FCB
+  D3D6   2DA0 E400      	CALL	@BDOS
+                        	; IGNORE RESULT - FILE MAY FIT IN ONE SECTOR
+                        
+  D3DA   0206 0500      	LI	R6,EXE_STG		;R6 = FIRST BLOCK HEADER
+  D3DE   0204 0900      	LI	R4,EXE_STG_END		;R4 = END OF STAGING
+  D3E2   04C8           	CLR	R8			;R8=0 = LAUNCH ADDRESS NOT YET CAPTURED
+  D3E4   04E0 02A6      	CLR	@OVL_COUNT		;RESET OVERLAY COUNTER BEFORE LOADING
+                        
+                        ;--- PROCESS ONE BLOCK HEADER ---
+                        LDRBLK_E:
+  D3E8   C1C6           	MOV	R6,R7			;R7 = HEADER START (FOR NEXT_OFFSET CALC)
+  D3EA   C176           	MOV	*R6+,R5			;R5 = NEXT_OFFSET
+  D3EC   C036           	MOV	*R6+,R0			;R0 = PAGE
+  D3EE   C0B6           	MOV	*R6+,R2			;R2 = START (COPY DESTINATION)
+  D3F0   C0F6           	MOV	*R6+,R3			;R3 = SIZE IN BYTES
+                        				;R6 NOW AT FIRST DATA BYTE OF THIS BLOCK
+                        
+                        ;--- CAPTURE LAUNCH ADDRESS FROM FIRST BLOCK ONLY ---
+  D3F2   C208           	MOV	R8,R8
+  D3F4   1601           	JNE	LDRMAP_E
+  D3F6   C202           	MOV	R2,R8			;R8 = LAUNCH ADDRESS (FIRST BLOCK START)
+                        
+                        ;--- PROGRAM MAPPER IF PAGED, REGISTER IN OVERLAY TABLES ---
+                        LDRMAP_E:
+  D3F8   C000           	MOV	R0,R0
+  D3FA   130E           	JEQ	LDRCPY_E		; PAGE 0 = COMMON, NO MAP_SET OR TABLE ENTRY
+                        
+                        	;--- INCREMENT OVLID COUNTER AND REGISTER THIS BLOCK ---
+                        	; OVL_COUNT starts at 0; each paged block gets next OVLID (1-based)
+  D3FC   05A0 02A6      	INC	@OVL_COUNT		; OVLID = OVL_COUNT (1=first paged block)
+  D400   C060 02A6      	MOV	@OVL_COUNT,R1		; R1 = OVLID
+  D404   0601           	DEC	R1			; R1 = OVLID-1 (0-based word offset)
+  D406   0A11           	SLA	R1,1			; R1 = (OVLID-1)*2
+  D408   C840 02AC      	MOV	R0,@OVL_PAGE_TAB(R1)	; STORE PHYSICAL PAGE
+  D40C   C242           	MOV	R2,R9
+  D40E   09C9           	SRL	R9,12			; SEGMENT = START >> 12
+  D410   C849 02CC      	MOV	R9,@OVL_SEG_TAB(R1)	; STORE VIRTUAL SEGMENT
+                        
+  D414   06A0 E054      	BL	@MAP_SET		; R9=SEGMENT R0=PAGE
+                        
+                        ;--- ENABLE PSEL AND COPY BLOCK ---
+                        LDRCPY_E:
+  D418   0209 0100      	LI	R9,PSEL_EN
+  D41C   2C89           	PSEL	R9
+  D41E   0913           	SRL	R3,1			;BYTES TO WORDS
+                        					;R3 = WORD COUNT
+                        LDRCPYW_E:
+  D420   CCB6           	MOV	*R6+,*R2+		;COPY WORD STAGING -> PAGED
+  D422   0603           	DEC	R3
+  D424   132C           	JEQ	LDRDONE_E		;BLOCK DONE
+  D426   8106           	C	R6,R4
+  D428   1AFB           	JL	LDRCPYW_E		;MORE IN STAGING
+                        
+                        ;--- STAGING EXHAUSTED MID-BLOCK: RELOAD ---
+                        LDRSEC_E:
+  D42A   04C9           	CLR	R9
+  D42C   2C89           	PSEL	R9			;PSEL OFF BEFORE BDOS
+  D42E   064A           	DECT	SP
+  D430   C688           	MOV	R8,*SP			;SAVE LAUNCH ADDRESS
+  D432   064A           	DECT	SP
+  D434   C687           	MOV	R7,*SP			;SAVE HEADER START
+  D436   064A           	DECT	SP
+  D438   C685           	MOV	R5,*SP			;SAVE NEXT_OFFSET
+  D43A   064A           	DECT	SP
+  D43C   C683           	MOV	R3,*SP			;SAVE WORD COUNT
+  D43E   064A           	DECT	SP
+  D440   C682           	MOV	R2,*SP			;SAVE PAGED DESTINATION
+  D442   0203 0500      	LI	R3,EXE_STG
+  D446   0202 001A      	LI	R2,SETDMA
+  D44A   2DA0 E400      	CALL	@BDOS
+  D44E   0202 0014      	LI	R2,RDSEQ
+  D452   0203 0280      	LI	R3,FCB
+  D456   2DA0 E400      	CALL	@BDOS
+  D45A   C0BA           	MOV	*SP+,R2			;RESTORE PAGED DESTINATION
+  D45C   C0FA           	MOV	*SP+,R3			;RESTORE WORD COUNT
+  D45E   C17A           	MOV	*SP+,R5			;RESTORE NEXT_OFFSET
+  D460   C1FA           	MOV	*SP+,R7			;RESTORE HEADER START
+  D462   C23A           	MOV	*SP+,R8			;RESTORE LAUNCH ADDRESS
+  D464   0281 FFFF      	CI	R1,-1
+  D468   1602           	JNE	LDRSEC_EOK
+  D46A   0460 D60A      	B	@LDRRUN			;EOF
+                        LDRSEC_EOK:
+  D46E   0209 0100      	LI	R9,PSEL_EN
+  D472   2C89           	PSEL	R9
+  D474   0206 0500      	LI	R6,EXE_STG		;RESET SOURCE
+  D478   0204 0900      	LI	R4,EXE_STG_END		;RESET END OF STAGING
+  D47C   10D1           	JMP	LDRCPYW_E
+                        
+                        ;--- BLOCK COPY COMPLETE ---
+                        LDRDONE_E:
+  D47E   04C9           	CLR	R9
+  D480   2C89           	PSEL	R9			;PSEL OFF
+                        
+                        ;--- FOLLOW CHAIN ---
+  D482   C145           	MOV	R5,R5
+  D484   1602           	JNE	LDRCHAIN_E
+  D486   0460 D60A      	B	@LDRRUN			;NEXT_OFFSET=0: LAST BLOCK, LAUNCH
+                        LDRCHAIN_E:
+                        
+  D48A   A1C5           	A	R5,R7			;R7 = HEADER START + NEXT_OFFSET = NEXT HEADER
+  D48C   C187           	MOV	R7,R6			;R6 = NEXT HEADER
+                        
+                        ;--- CHECK IF NEXT HEADER IN STAGING ---
+  D48E   8106           	C	R6,R4
+  D490   1AAB           	JL	LDRBLK_E		;IN STAGING - PROCESS IT
+                        
+                        ;--- NEXT HEADER BEYOND STAGING: RELOAD ---
+                        ;  next header may land in the next sector. Calculate overshoot,
+                        ;  reload, position R6 at overshoot offset within new sector.
+  D492   6184           	S	R4,R6			;R6 = BYTES PAST END OF STAGING
+  D494   064A           	DECT	SP
+  D496   C688           	MOV	R8,*SP			;SAVE LAUNCH ADDRESS
+  D498   064A           	DECT	SP
+  D49A   C685           	MOV	R5,*SP			;SAVE NEXT_OFFSET (DONE WITH IT BUT TIDY)
+  D49C   064A           	DECT	SP
+  D49E   C686           	MOV	R6,*SP			;SAVE OVERSHOOT
+  D4A0   0203 0500      	LI	R3,EXE_STG
+  D4A4   0202 001A      	LI	R2,SETDMA
+  D4A8   2DA0 E400      	CALL	@BDOS
+  D4AC   0202 0014      	LI	R2,RDSEQ
+  D4B0   0203 0280      	LI	R3,FCB
+  D4B4   2DA0 E400      	CALL	@BDOS
+  D4B8   C1BA           	MOV	*SP+,R6			;RESTORE OVERSHOOT
+  D4BA   C17A           	MOV	*SP+,R5
+  D4BC   C23A           	MOV	*SP+,R8			;RESTORE LAUNCH ADDRESS
+  D4BE   0204 0900      	LI	R4,EXE_STG_END
+  D4C2   0226 0500      	AI	R6,EXE_STG		;R6 = STAGING + OVERSHOOT
+  D4C6   1090           	JMP	LDRBLK_E
+                        
+  D4C8                  END_LOADER_EXE:	EQU	$+0
+                        
+                        ;*******************************************************************
+                        ;  COPY_OVLMGR - copy OVLMGR code to common at OVLMGR_BASE (0A00H)
+                        ;
+                        ;  Called once at shell startup (INIT). Copies OVLMGR_CODE to 0A00H
+                        ;  then installs vectors at OVL_INIT_VEC/OVL_SWAP_VEC.
+                        ;  Uses BL/RT (R11 = return address).
+                        ;  Modifies: R0, R1, R2
+                        ;*******************************************************************
+                        COPY_OVLMGR:
+  D4C8   0200 D4EE      	LI	R0,OVLMGR_CODE			; SOURCE IN SHELL
+  D4CC   0201 0A00      	LI	R1,OVLMGR_BASE			; DESTINATION = 0A00H
+  D4D0   0202 004E      	LI	R2,OVLMGR_CODE_END-OVLMGR_CODE	; SIZE IN BYTES
+  D4D4   0912           	SRL	R2,1				; TO WORDS
+                        COPY_OVL1:
+  D4D6   CC70           	MOV	*R0+,*R1+
+  D4D8   0602           	DEC	R2
+  D4DA   16FD           	JNE	COPY_OVL1
+                        	;--- INSTALL VECTOR ADDRESSES ---
+                        	; Callers use: MOV @OVL_INIT_VEC,R0 / BL *R0
+  D4DC   0200 D4F6      	LI	R0,OVLMGR_CI			; ADDRESS OF OVLMGR_INIT CODE
+  D4E0   C800 02A2      	MOV	R0,@OVL_INIT_VEC		; 02A2H
+  D4E4   0200 D508      	LI	R0,OVLMGR_C			; ADDRESS OF OVLMGR CODE
+  D4E8   C800 02A4      	MOV	R0,@OVL_SWAP_VEC		; 02A4H
+  D4EC   045B           	RT
+                        
+                        ;*******************************************************************
+                        ;  OVLMGR_CODE - overlay manager code stored in shell, copied to 0A00H
+                        ;
+                        ;  This is position-independent code - all addresses are absolute.
+                        ;  When copied to 0A00H the layout is:
+                        ;    0A00H  B @OVLMGR_INIT  (4 bytes)
+                        ;    0A04H  B @OVLMGR       (4 bytes)
+                        ;    0A08H  OVLMGR_INIT code
+                        ;    0A??H  OVLMGR code
+                        ;
+                        ;  NOTE: assembled inline here but logically runs at 0A00H.
+                        ;  All absolute addresses (OVL_PAGE_TAB, MAP_WIN_BASE etc) are
+                        ;  correct regardless of where this code is stored in the shell.
+                        ;*******************************************************************
+                        OVLMGR_CODE:
+                        	;--- VECTOR TABLE ---
+  D4EE   0460 D4F6      	B	@OVLMGR_CI			; 0A00H: -> OVLMGR_INIT
+  D4F2   0460 D508      	B	@OVLMGR_C			; 0A04H: -> OVLMGR
+                        
+                        	;--- OVLMGR_INIT ---
+                        	; Clear current overlay state, enable PSEL
+                        	; Entry: nothing  Exit: OVL_CURR_ID=0, PSEL enabled
+                        	; R11 = return address (BL caller)
+                        OVLMGR_CI:
+  D4F6   04C0           	CLR	R0
+  D4F8   C800 02A8      	MOV	R0,@OVL_CURR_ID			; NO OVERLAY LOADED
+  D4FC   C800 02AA      	MOV	R0,@OVL_CURR_SEG			; NO SEGMENT MAPPED
+  D500   0209 0100      	LI	R9,PSEL_EN
+  D504   2C89           	PSEL	R9				; ENABLE PSEL
+  D506   045B           	B	*R11				; RETURN (BL caller)
+                        
+                        	;--- OVLMGR ---
+                        	; Entry:  R1 = OVLID (1-based)
+                        	; Exit:   segment mapped to physical page, PSEL enabled
+                        	; Modifies: R0, R3, R9, R12
+                        	; Preserves: R1, R2, R4-R8, R10, R11, R13-R15
+                        OVLMGR_C:
+                        	;--- ALREADY LOADED? ---
+  D508   8801 02A8      	C	R1,@OVL_CURR_ID
+  D50C   1316           	JEQ	OVLMGR_CR			; YES - NOTHING TO DO
+                        
+                        	;--- UPDATE CURRENT STATE ---
+  D50E   C801 02A8      	MOV	R1,@OVL_CURR_ID
+                        
+                        	;--- LOOK UP PAGE AND SEGMENT FOR THIS OVLID ---
+                        	; Tables at OVL_PAGE_TAB/OVL_SEG_TAB, word-indexed by (OVLID-1)
+  D512   C0C1           	MOV	R1,R3
+  D514   0603           	DEC	R3				; R3 = OVLID-1 (0-based)
+  D516   0A13           	SLA	R3,1				; R3 = (OVLID-1)*2 (word offset)
+                        						; NOTE: R0 cannot be used as index on TMS9900
+  D518   C023 02AC      	MOV	@OVL_PAGE_TAB(R3),R0		; R0 = PHYSICAL PAGE
+  D51C   C263 02CC      	MOV	@OVL_SEG_TAB(R3),R9		; R9 = VIRTUAL SEGMENT
+  D520   C809 02AA      	MOV	R9,@OVL_CURR_SEG
+                        
+                        	;--- DISABLE PSEL BEFORE CRU ACCESS ---
+  D524   04CC           	CLR	R12
+  D526   2C8C           	PSEL	R12
+                        
+                        	;--- PROGRAM MAPPER: SEGMENT R9 -> PAGE R0 ---
+  D528   020C 80C0      	LI	R12,MAP_WIN_BASE
+  D52C   0A19           	SLA	R9,1				; SEGMENT*2 = CRU BIT OFFSET
+  D52E   A309           	A	R9,R12				; R12 = CRU ADDRESS FOR THIS SEGMENT
+  D530   0A80           	SLA	R0,8				; PAGE TO HIGH BYTE FOR LDCR
+  D532   3080           	LDCR	R0,BYTEWIDE
+                        
+                        	;--- RE-ENABLE PSEL ---
+  D534   0209 0100      	LI	R9,PSEL_EN
+  D538   2C89           	PSEL	R9
+                        
+                        OVLMGR_CR:
+  D53A   045B           	B	*R11				; RETURN (BL caller)
+                        
+  D53C                  OVLMGR_CODE_END:	EQU	$+0
+                        
+                        ;*******************************************************************
+                        ;  LOADERCODE v5.7
+                        ;
+                        ;  Copied to LOADER (0x0300) by INIT_LOADER. Runs from COMMON.
+                        ;  Handles .COM flat binary files only.
+                        ;  .EXE paged chain format is handled by LOADERCODE_EXE.
+                        ;
+                        ;  Load sequence:
+                        ;    1. Read first sector to STAGING
+                        ;    2. Copy STAGING to LADDR, read remaining sectors to LADDR+N
+                        ;    3. Launch from LADDR (no PSEL, mapper untouched)
+                        ;
+                        ;  Key registers:
+                        ;    R3   sector DMA address / load pointer
+                        ;    R9   launch address (= LADDR)
                         ;*******************************************************************
                         
                         LOADERCODE:
                         
-                        ;--- CLEAR ALL MAP REGISTERS TO PAGE 0 ---
-  D312   020C 80C0      	LI	R12,MAP_WIN_BASE
-  D316   04C0           	CLR	R0
-  D318   0201 0010      	LI	R1,NUM_SEGS
-  D31C   3080           LDRCL:	LDCR	R0,BYTEWIDE
-  D31E   05CC           	INCT	R12
-  D320   0601           	DEC	R1
-  D322   16FC           	JNE	LDRCL
+                        ;--- ENSURE PSEL DISABLED BEFORE ANY BDOS CALLS ---
+  D53C   04CF           	CLR	R15
+  D53E   026F 0007      	ORI	R15,0007H		;INTERRUPT MASK=7, PSEL BIT CLEAR
+  D542   008F           	LST	R15
                         
                         ;--- READ FIRST SECTOR TO STAGING (0x0500) ---
-  D324   04C0           	CLR	R0
-  D326   0203 0500      	LI	R3,0500H		;STAGING BUFFER
-  D32A   0202 001A      	LI	R2,SETDMA
-  D32E   2DA0 E400      	CALL	@BDOS
-  D332   0202 0014      	LI	R2,RDSEQ
-  D336   0203 0280      	LI	R3,FCB
-  D33A   2DA0 E400      	CALL	@BDOS
-  D33E   0281 FFFF      	CI	R1,-1
-  D342   1602           	JNE	LDRDET
-  D344   0460 D480      	B	@LDRRUN_F		;EMPTY FILE
-  D348   C041           LDRDET:	MOV	R1,R1
-  D34A   1101           	JLT	LDRDET_ERR
-  D34C   1002           	JMP	LDRDET1
+  D544   04C0           	CLR	R0
+  D546   0203 0500      	LI	R3,0500H		;STAGING BUFFER
+  D54A   0202 001A      	LI	R2,SETDMA
+  D54E   2DA0 E400      	CALL	@BDOS
+  D552   0202 0014      	LI	R2,RDSEQ
+  D556   0203 0280      	LI	R3,FCB
+  D55A   2DA0 E400      	CALL	@BDOS
+  D55E   0281 FFFF      	CI	R1,-1
+  D562   1602           	JNE	LDRDET
+  D564   0460 D5C0      	B	@LDRRUN_F		;EMPTY FILE
+  D568   C041           LDRDET:	MOV	R1,R1
+  D56A   1101           	JLT	LDRDET_ERR
+  D56C   1002           	JMP	LDRRAW
                         LDRDET_ERR:
-  D34E   0460 D49A      	B	@LDRERR
-                        LDRDET1:
-                        
-                        ;--- DETECT FORMAT ---
-                        ;  First word FFFF = link99 format (opening sentinel)
-                        ;  Anything else  = raw binary
-  D352   0206 0500      	LI	R6,0500H		;START OF STAGING
-  D356   C016           	MOV	*R6,R0
-  D358   0280 FFFF      	CI	R0,0FFFFH
-  D35C   1601           	JNE	LDRDET2			;NOT FFFF = RAW BINARY
-  D35E   1002           	JMP	LDRPM
-  D360   0460 D432      LDRDET2:	B	@LDRRAW
-                        
-                        ;--- WALK PAGEMAP ---
-                        ;  R6 points at current sentinel on first entry and after each entry
-                        ;  LDRPM:  skip sentinel then peek at next word
-                        ;  LDRPM1: re-entry point after processing an entry (R6 at next sentinel)
-  D364   0226 0006      LDRPM:	AI	R6,6			;SKIP SENTINEL - R6 NOW AT ENTRY OR CLOSING SENTINEL
-  D368   C016           LDRPM1:	MOV	*R6,R0
-  D36A   0280 FFFF      	CI	R0,0FFFFH
-  D36E   1314           	JEQ	LDRSENT			;CLOSING SENTINEL = END OF PAGEMAP
-  D370   C1F6           	MOV	*R6+,R7			;R7 = START ADDRESS
-  D372   C207           	MOV	R7,R8			;R8 = LAUNCH ADDRESS (FIRST ENTRY)
-  D374   C076           	MOV	*R6+,R1			;R1 = END ADDRESS
-  D376   C136           	MOV	*R6+,R4			;R4 = PAGE NUMBER
-  D378   C004           	MOV	R4,R0
-  D37A   13F6           	JEQ	LDRPM1			;PAGE 0 = FLAT - SKIP MAP_SET - R6 AT NEXT SENTINEL
-                        
-  D37C   C007           LDRSEG:	MOV	R7,R0
-  D37E   09C0           	SRL	R0,12			;SEGMENT = ADDR >> 12
-  D380   0280 000C      	CI	R0,PROT_SEG
-  D384   1404           	JHE	LDRPROT
-  D386   C240           	MOV	R0,R9			;R9 = SEGMENT
-  D388   C004           	MOV	R4,R0			;R0 = PAGE
-  D38A   06A0 DE9A      	BL	@MAP_SET
-                        LDRPROT:
-  D38E   0227 1000      	AI	R7,SEG_SIZE
-  D392   8047           	C	R7,R1
-  D394   1AF3           	JL	LDRSEG
-  D396   10E8           	JMP	LDRPM1			;NEXT ENTRY - R6 ALREADY AT NEXT SENTINEL
-                        
-                        ;--- CLOSING SENTINEL: ENABLE PSEL, SET UP COPY ---
-                        LDRSENT:
-  D398   0226 0006      	AI	R6,6			;SKIP CLOSING SENTINEL
-  D39C   C088           	MOV	R8,R2			;R2 = COPY DESTINATION
-  D39E   0209 0100      	LI	R9,PSEL_EN
-  D3A2   2C89           	PSEL	R9			;ENABLE PSEL ONCE
-                        
-                        ;--- READ BLOCK SIZE AND SET UP WORD COUNT ---
-  D3A4   C156           LDRBLK:	MOV	*R6,R5
-  D3A6   0285 FFFF      	CI	R5,0FFFFH
-  D3AA   132E           	JEQ	LDRRUN
-  D3AC   0285 0000      	CI	R5,0
-  D3B0   132B           	JEQ	LDRRUN
-  D3B2   05C6           	INCT	R6			;SKIP SIZE WORD
-  D3B4   C046           	MOV	R6,R1			;R1 = SOURCE
-  D3B6   0915           	SRL	R5,1			;BYTES TO WORDS
-  D3B8   C0C5           	MOV	R5,R3			;R3 = WORD COUNT
-  D3BA   0204 0700      	LI	R4,0700H		;R4 = END OF STAGING
-                        
-                        ;--- COPY WORDS: STAGING -> PAGED MEMORY (PSEL ACTIVE) ---
-  D3BE   CCB1           LDRCPY:	MOV	*R1+,*R2+
-  D3C0   0603           	DEC	R3
-  D3C2   1322           	JEQ	LDRRUN			;ALL WORDS DONE
-  D3C4   8101           	C	R1,R4
-  D3C6   1AFB           	JL	LDRCPY			;MORE IN STAGING
-                        
-                        ;--- STAGING EXHAUSTED: RELOAD NEXT SECTOR TO STAGING ---
-                        ;  Stack saves are safe - BDOS uses own workspace via CALL XOP
-  D3C8   064A           LDRSEC:	DECT	SP
-  D3CA   C688           	MOV	R8,*SP			;SAVE LAUNCH ADDRESS
-  D3CC   064A           	DECT	SP
-  D3CE   C682           	MOV	R2,*SP			;SAVE PAGED DESTINATION
-  D3D0   064A           	DECT	SP
-  D3D2   C683           	MOV	R3,*SP			;SAVE WORD COUNT
-  D3D4   0203 0500      	LI	R3,0500H		;DMA TO STAGING
-  D3D8   0202 001A      	LI	R2,SETDMA
-  D3DC   2DA0 E400      	CALL	@BDOS
-  D3E0   0202 0014      	LI	R2,RDSEQ
-  D3E4   0203 0280      	LI	R3,FCB
-  D3E8   2DA0 E400      	CALL	@BDOS
-  D3EC   C0FA           	MOV	*SP+,R3			;RESTORE WORD COUNT
-  D3EE   C0BA           	MOV	*SP+,R2			;RESTORE PAGED DESTINATION
-  D3F0   C23A           	MOV	*SP+,R8			;RESTORE LAUNCH ADDRESS
-  D3F2   0281 FFFF      	CI	R1,-1
-  D3F6   1308           	JEQ	LDRRUN			;EOF - ALL DATA LOADED
-  D3F8   0209 0100      	LI	R9,PSEL_EN		;RE-ENABLE PSEL
-  D3FC   2C89           	PSEL	R9
-  D3FE   0201 0500      	LI	R1,0500H		;RESET SOURCE TO START OF STAGING
-  D402   0204 0700      	LI	R4,0700H		;RESET END OF STAGING
-  D406   10DB           	JMP	LDRCPY			;RESUME COPY
-                        
-                        ;--- LAUNCH PAGED PROGRAM ---
-  D408   C020 D5BC      LDRRUN:	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
-  D40C   1609           	JNE	LDRRUN_LOAD		;YES - SKIP EXECUTE
-  D40E   0200 DE1E      	LI	R0,INT2_HANDLER
-  D412   C800 000A      	MOV	R0,@INT2_VEC
-  D416   04CF           	CLR	R15
-  D418   026F 0007      	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
-  D41C   008F           	LST	R15
-  D41E   0458           	B	*R8
-                        LDRRUN_LOAD:
-  D420   04C9           	CLR	R9
-  D422   2C89           	PSEL	R9			;DISABLE PSEL
-  D424   04C0           	CLR	R0
-  D426   C800 D5BC      	MOV	R0,@LOAD_ONLY		;CLEAR FLAG
-  D42A   2FA0 D4B8      	MESG	@TXT_LOADED		;CONFIRM LOAD
-  D42E   0460 D4EE      	B	@NEXTCMD		;BACK TO SHELL PROMPT
+  D56E   0460 D5E2      	B	@LDRERR
                         
                         ;--- RAW BINARY: LOAD TO LADDR, LAUNCH FROM LADDR ---
-  D432   C260 DD10      LDRRAW:	MOV	@LADDR,R9		;R9 = LAUNCH ADDRESS
-  D436   0203 0500      	LI	R3,0500H		;COPY STAGING -> LADDR
-  D43A   C120 DD10      	MOV	@LADDR,R4
-  D43E   CD33           LDRRAW1:MOV	*R3+,*R4+
-  D440   0283 0700      	CI	R3,0700H		;END OF STAGING
-  D444   1AFC           	JL	LDRRAW1
-  D446   C0E0 DD10      	MOV	@LADDR,R3
-  D44A   0223 0200      	AI	R3,BYTSEC		;NEXT SECTOR
+  D572   C260 DECA      LDRRAW:	MOV	@LADDR,R9		;R9 = LAUNCH ADDRESS
+  D576   0203 0500      	LI	R3,0500H		;COPY STAGING -> LADDR
+  D57A   C120 DECA      	MOV	@LADDR,R4
+  D57E   CD33           LDRRAW1:MOV	*R3+,*R4+
+  D580   0283 0700      	CI	R3,0700H		;END OF STAGING
+  D584   1AFC           	JL	LDRRAW1
+  D586   C0E0 DECA      	MOV	@LADDR,R3
+  D58A   0223 0200      	AI	R3,BYTSEC		;NEXT SECTOR
                         
-  D44E   064A           LDRRAWS:DECT	SP
-  D450   C683           	MOV	R3,*SP
-  D452   0202 001A      	LI	R2,SETDMA
-  D456   2DA0 E400      	CALL	@BDOS
-  D45A   0202 0014      	LI	R2,RDSEQ
-  D45E   0203 0280      	LI	R3,FCB
-  D462   2DA0 E400      	CALL	@BDOS
-  D466   C0FA           	MOV	*SP+,R3
-  D468   0281 FFFF      	CI	R1,-1
-  D46C   1602           	JNE	LDRRAWS1
-  D46E   0460 D480      	B	@LDRRUN_F
+  D58E   064A           LDRRAWS:DECT	SP
+  D590   C683           	MOV	R3,*SP
+  D592   0202 001A      	LI	R2,SETDMA
+  D596   2DA0 E400      	CALL	@BDOS
+  D59A   0202 0014      	LI	R2,RDSEQ
+  D59E   0203 0280      	LI	R3,FCB
+  D5A2   2DA0 E400      	CALL	@BDOS
+  D5A6   C0FA           	MOV	*SP+,R3
+  D5A8   0281 FFFF      	CI	R1,-1
+  D5AC   1602           	JNE	LDRRAWS1
+  D5AE   0460 D5C0      	B	@LDRRUN_F
                         LDRRAWS1:
-  D472   C041           	MOV	R1,R1
-  D474   1103           	JLT	LDRRAWS_ERR
-  D476   0223 0200      	AI	R3,BYTSEC
-  D47A   10E9           	JMP	LDRRAWS
+  D5B2   C041           	MOV	R1,R1
+  D5B4   1103           	JLT	LDRRAWS_ERR
+  D5B6   0223 0200      	AI	R3,BYTSEC
+  D5BA   10E9           	JMP	LDRRAWS
                         LDRRAWS_ERR:
-  D47C   0460 D49A      	B	@LDRERR
+  D5BC   0460 D5E2      	B	@LDRERR
                         
                         ;--- LAUNCH RAW/FLAT (NO PSEL) ---
                         LDRRUN_F:
-  D480   C020 D5BC      	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
-  D484   16CD           	JNE	LDRRUN_LOAD		;YES - SKIP EXECUTE
-  D486   0200 DE1E      	LI	R0,INT2_HANDLER		;INSTALL INT2 DEBUG HANDLER
-  D48A   C800 000A      	MOV	R0,@INT2_VEC
-  D48E   04CF           	CLR	R15
-  D490   026F 0007      	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
-  D494   008F           	LST	R15
-  D496   C089           	MOV	R9,R2
-  D498   0452           	B	*R2
+  D5C0   C020 D734      	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
+  D5C4   1302           	JEQ	LDRRUN_F1		;NO - EXECUTE
+  D5C6   0460 D628      	B	@LDRRUN_LOAD		;YES - ABSOLUTE BRANCH TO SHELL
+                        LDRRUN_F1:
+  D5CA   0200 DFD8      	LI	R0,INT2_HANDLER		;INSTALL INT2 DEBUG HANDLER
+  D5CE   C800 000A      	MOV	R0,@INT2_VEC
+  D5D2   04C0           	CLR	R0			;DISABLE PSEL WITHOUT CLOBBERING R9
+  D5D4   2C80           	PSEL	R0			;ENSURE PSEL DISABLED FOR FLAT COM LAUNCH
+  D5D6   04CF           	CLR	R15			;CLEAR ALL STATUS BITS
+  D5D8   026F 0007      	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
+  D5DC   008F           	LST	R15
+  D5DE   C089           	MOV	R9,R2
+  D5E0   0452           	B	*R2
                         
-  D49A   2FA0 D4A2      LDRERR:	MESG	@TXT_LDRERR
-  D49E   0460 D4C2      	B	@RETURN
+  D5E2   2FA0 D5EA      LDRERR:	MESG	@TXT_LDRERR
+  D5E6   0460 D63A      	B	@RETURN
                         
-  D4A2   2D2D 4C6F      TXT_LDRERR:	TEXT	'--Loader read error'
-  D4A6   6164 6572      
-  D4AA   2072 6561      
-  D4AE   6420 6572      
-  D4B2   726F 72        
-  D4B5   0D0A 00        		BYTE	0DH,0AH,0
-  D4B8                  		EVEN
-  D4B8   4C6F 6164      TXT_LOADED:	TEXT	'Loaded'
-  D4BC   6564           
-  D4BE   0D0A 00        		BYTE	0DH,0AH,0
-  D4C1   00             		EVEN
+  D5EA   2D2D 4C6F      TXT_LDRERR:	TEXT	'--Loader read error'
+  D5EE   6164 6572      
+  D5F2   2072 6561      
+  D5F6   6420 6572      
+  D5FA   726F 72        
+  D5FD   0D0A 00        		BYTE	0DH,0AH,0
+  D600                  		EVEN
+  D600   4C6F 6164      TXT_LOADED:	TEXT	'Loaded'
+  D604   6564           
+  D606   0D0A 00        		BYTE	0DH,0AH,0
+  D609   00             		EVEN
                         
-  D4C2                  END_LOADER:	EQU	$+0
+  D60A                  END_LOADER:	EQU	$+0
+                        
+                        ;*******************************************************************
+                        ;  LDRRUN / LDRRUN_LOAD - permanent shell routines
+                        ;  Called by both LOADERCODE (COM) and LOADERCODE_EXE (EXE).
+                        ;  Must live in protected shell segments, never inside a LOADERCODE
+                        ;  block. Absolute B @LDRRUN branches from COMMON are safe because
+                        ;  shell is always resident in segments 12-15.
+                        ;*******************************************************************
+                        
+                        ;--- LAUNCH PAGED PROGRAM (PSEL WILL BE ENABLED) ---
+  D60A   C020 D734      LDRRUN:	MOV	@LOAD_ONLY,R0		;LOAD ONLY?
+  D60E   160C           	JNE	LDRRUN_LOAD		;YES - SKIP EXECUTE
+  D610   0200 DFD8      	LI	R0,INT2_HANDLER
+  D614   C800 000A      	MOV	R0,@INT2_VEC
+  D618   04CF           	CLR	R15
+  D61A   026F 0007      	ORI	R15,0007H		;ST7=0=PRIVILEGED, INTERRUPT MASK=7
+  D61E   008F           	LST	R15
+  D620   0209 0100      	LI	R9,PSEL_EN		;ENABLE PSEL BEFORE LAUNCH
+  D624   2C89           	PSEL	R9
+                        ;	HALT
+  D626   0458           	B	*R8			;LAUNCH FROM R8
+                        
+                        LDRRUN_LOAD:
+  D628   04C9           	CLR	R9
+  D62A   2C89           	PSEL	R9			;DISABLE PSEL
+  D62C   04C0           	CLR	R0
+  D62E   C800 D734      	MOV	R0,@LOAD_ONLY		;CLEAR FLAG
+  D632   2FA0 D600      	MESG	@TXT_LOADED		;CONFIRM LOAD
+  D636   0460 D666      	B	@NEXTCMD		;BACK TO SHELL PROMPT
                         ;*******************************************************************
                         ;	RETURN - program exit
                         ;*******************************************************************
-  D4C2   06A0 DE82      RETURN:	BL	@MAP_INIT
-  D4C6   D801 024E      	MOVB	R1,@CMDLINE-2
-  D4CA   02E0 0230      	LWPI	WORKSP
-  D4CE   020A 1000      	LI	SP,STACKP
-  D4D2   04CF           	CLR	R15
-  D4D4   D060 024E      	MOVB	@CMDLINE-2,R1
-  D4D8   0881           	SRA	R1,8
-  D4DA   0281 FFFF      	CI	R1,-1
-  D4DE   1607           	JNE	NEXTCMD
-  D4E0   04C1           	CLR	R1
-  D4E2   D801 024E      	MOVB	R1,@CMDLINE-2
-  D4E6   C041           	MOV	R1,R1
-  D4E8   1302           	JEQ	NEXTCMD
-  D4EA   0460 DBCA      	B	@UNPROC
+  D63A   06A0 E03C      RETURN:	BL	@MAP_INIT
+  D63E   D801 024E      	MOVB	R1,@CMDLINE-2
+  D642   02E0 0230      	LWPI	WORKSP
+  D646   020A 1000      	LI	SP,STACKP
+  D64A   04CF           	CLR	R15
+  D64C   D060 024E      	MOVB	@CMDLINE-2,R1
+  D650   0881           	SRA	R1,8
+  D652   0281 FFFF      	CI	R1,-1
+  D656   1607           	JNE	NEXTCMD
+  D658   04C1           	CLR	R1
+  D65A   D801 024E      	MOVB	R1,@CMDLINE-2
+  D65E   C041           	MOV	R1,R1
+  D660   1302           	JEQ	NEXTCMD
+  D662   0460 DD84      	B	@UNPROC
                         
                         ;*******************************************************************
                         ;	NEXTCMD / PROMPT
                         ;*******************************************************************
-  D4EE   D060 DD06      NEXTCMD	MOVB	@PROCSW,R1
-  D4F2   1302           	JEQ	PROMPT
-  D4F4   0460 DA10      	B	@PFETCH
+  D666   D060 DEC0      NEXTCMD	MOVB	@PROCSW,R1
+  D66A   1302           	JEQ	PROMPT
+  D66C   0460 DBCC      	B	@PFETCH
                         
-  D4F8   D0E0 D021      PROMPT:	MOVB	@PROM,R3
-  D4FC   2DA0 DCC4      	CALL	@OUTCHAR
-  D500   0204 0250      	LI	R4,CMDLINE
-  D504   0205 0040      	LI	R5,CLSZ
-  D508   C060 0000      CINLOOP	MOV	@CONSOLE,R1
-  D50C   2DA0 DCB8      	CALL	@INCHAR
-  D510   9801 D017      	CB	R1,@BS
-  D514   132A           	JEQ	RUBOUT
-  D516   9801 D01A      	CB	R1,@DEL
-  D51A   1327           	JEQ	RUBOUT
-  D51C   9801 D010      	CB	R1,@CTLC
-  D520   1604           	JNE	STOWIT
-  D522   D060 D018      	MOVB	@CR,R1
-  D526   D801 0250      	MOVB	R1,@CMDLINE
+  D670   D0E0 D021      PROMPT:	MOVB	@PROM,R3
+  D674   2DA0 DE7E      	CALL	@OUTCHAR
+  D678   0204 0250      	LI	R4,CMDLINE
+  D67C   0205 0040      	LI	R5,CLSZ
+  D680   C060 0000      CINLOOP	MOV	@CONSOLE,R1
+  D684   2DA0 DE72      	CALL	@INCHAR
+  D688   9801 D017      	CB	R1,@BS
+  D68C   132A           	JEQ	RUBOUT
+  D68E   9801 D01A      	CB	R1,@DEL
+  D692   1327           	JEQ	RUBOUT
+  D694   9801 D010      	CB	R1,@CTLC
+  D698   1604           	JNE	STOWIT
+  D69A   D060 D018      	MOVB	@CR,R1
+  D69E   D801 0250      	MOVB	R1,@CMDLINE
                         
-  D52A   C001           STOWIT	MOV	R1,R0
-  D52C   0980           	SRL	R0,8
-  D52E   0280 0061      	CI	R0,61H
-  D532   1A08           	JL	STOWIT2
-  D534   0280 007A      	CI	R0,7AH
-  D538   1B05           	JH	STOWIT2
-  D53A   0220 FFE0      	AI	R0,-20H
-  D53E   06C0           	SWPB	R0
-  D540   DD00           	MOVB	R0,*R4+
-  D542   1001           	JMP	STOWIT2+2
-  D544   DD01           STOWIT2	MOVB	R1,*R4+
-  D546   0605           	DEC	R5
-  D548   1224           	JLE	CIOERR
-  D54A   9801 D015      	CB	R1,@SPACE
-  D54E   1404           	JHE	ECHO
-  D550   04C0           	CLR	R0
-  D552   D060 D018      	MOVB	@CR,R1
-  D556   D500           	MOVB	R0,*R4
-  D558   C0C1           ECHO	MOV	R1,R3
-  D55A   2DA0 DCC4      	CALL	@OUTCHAR
-  D55E   04E0 DD08      	CLR	@SKIPSW
-  D562   9801 D019      	CB	R1,@LF
-  D566   130E           	JEQ	GODOCMD
-  D568   10CF           	JMP	CINLOOP
-  D56A   0285 0040      RUBOUT	CI	R5,CLSZ
-  D56E   14CC           	JHE	CINLOOP
-  D570   0585           	INC	R5
-  D572   0604           	DEC	R4
-  D574   064A           	DECT	SP
-  D576   C684           	MOV	R4,*SP
-  D578   0204 DDD2      	LI	R4,RUBMSG
-  D57C   2DA0 DCEE      	CALL	@OUTSTR
-  D580   C13A           	MOV	*SP+,R4
-  D582   10C2           	JMP	CINLOOP
-  D584   0200 0250      GODOCMD	LI	R0,CMDLINE
-  D588   6100           	S	R0,R4
-  D58A   C804 00A2      	MOV	R4,@CMDL_SIZE
-  D58E   0460 D0B8      	B	@DOCMD
-  D592   0460 DB98      CIOERR	B	@LINERR
+  D6A2   C001           STOWIT	MOV	R1,R0
+  D6A4   0980           	SRL	R0,8
+  D6A6   0280 0061      	CI	R0,61H
+  D6AA   1A08           	JL	STOWIT2
+  D6AC   0280 007A      	CI	R0,7AH
+  D6B0   1B05           	JH	STOWIT2
+  D6B2   0220 FFE0      	AI	R0,-20H
+  D6B6   06C0           	SWPB	R0
+  D6B8   DD00           	MOVB	R0,*R4+
+  D6BA   1001           	JMP	STOWIT2+2
+  D6BC   DD01           STOWIT2	MOVB	R1,*R4+
+  D6BE   0605           	DEC	R5
+  D6C0   1224           	JLE	CIOERR
+  D6C2   9801 D015      	CB	R1,@SPACE
+  D6C6   1404           	JHE	ECHO
+  D6C8   04C0           	CLR	R0
+  D6CA   D060 D018      	MOVB	@CR,R1
+  D6CE   D500           	MOVB	R0,*R4
+  D6D0   C0C1           ECHO	MOV	R1,R3
+  D6D2   2DA0 DE7E      	CALL	@OUTCHAR
+  D6D6   04E0 DEC2      	CLR	@SKIPSW
+  D6DA   9801 D019      	CB	R1,@LF
+  D6DE   130E           	JEQ	GODOCMD
+  D6E0   10CF           	JMP	CINLOOP
+  D6E2   0285 0040      RUBOUT	CI	R5,CLSZ
+  D6E6   14CC           	JHE	CINLOOP
+  D6E8   0585           	INC	R5
+  D6EA   0604           	DEC	R4
+  D6EC   064A           	DECT	SP
+  D6EE   C684           	MOV	R4,*SP
+  D6F0   0204 DF8C      	LI	R4,RUBMSG
+  D6F4   2DA0 DEA8      	CALL	@OUTSTR
+  D6F8   C13A           	MOV	*SP+,R4
+  D6FA   10C2           	JMP	CINLOOP
+  D6FC   0200 0250      GODOCMD	LI	R0,CMDLINE
+  D700   6100           	S	R0,R4
+  D702   C804 00A2      	MOV	R4,@CMDL_SIZE
+  D706   0460 D0CA      	B	@DOCMD
+  D70A   0460 DD52      CIOERR	B	@LINERR
                         
                         ;*******************************************************************
                         ;	INTERNAL COMMANDS
                         ;*******************************************************************
   0005                  CMDCNT	EQU	5
-  D596   4449 52        ICLIST	TEXT	"DIR"
-  D599   00             	BYTE	0
-  D59A   D614           	WORD	DSKDIR
-  D59C   5341 5645      	TEXT	"SAVE"
-  D5A0   00             	BYTE	0
-  D5A1   D6B6           	WORD	DSKSAVE
-  D5A3   4552 41        	TEXT	"ERA"
-  D5A6   00             	BYTE	0
-  D5A7   D7B6           	WORD	ERAFILE
-  D5A9   5459 5045      	TEXT	"TYPE"
-  D5AD   00             	BYTE	0
-  D5AE   D950           	WORD	TYPEFILE
-  D5B0   4C4F 4144      	TEXT	"LOAD"
-  D5B4   00             	BYTE	0
-  D5B5   D842           	WORD	DOLOAD
-  D5B7   00             	EVEN
+  D70E   4449 52        ICLIST	TEXT	"DIR"
+  D711   00             	BYTE	0
+  D712   D78C           	WORD	DSKDIR
+  D714   5341 5645      	TEXT	"SAVE"
+  D718   00             	BYTE	0
+  D719   D82E           	WORD	DSKSAVE
+  D71B   4552 41        	TEXT	"ERA"
+  D71E   00             	BYTE	0
+  D71F   D92E           	WORD	ERAFILE
+  D721   5459 5045      	TEXT	"TYPE"
+  D725   00             	BYTE	0
+  D726   DB0C           	WORD	TYPEFILE
+  D728   4C4F 4144      	TEXT	"LOAD"
+  D72C   00             	BYTE	0
+  D72D   D9BA           	WORD	DOLOAD
+  D72F   00             	EVEN
                         
-  D5B8   0000           BUFPNT	WORD	0
-  D5BA   0000           RECCNT	WORD	0
-  D5BC   0000           LOAD_ONLY:	WORD	0			;NON-ZERO = LOAD WITHOUT EXECUTE
-  D5BE   0000           SADDR	WORD	0
-  D5C0   2D             SWITCH	BYTE	'-'
-  D5C1   00             	EVEN
+  D730   0000           BUFPNT	WORD	0
+  D732   0000           RECCNT	WORD	0
+  D734   0000           LOAD_ONLY:	WORD	0			;NON-ZERO = LOAD WITHOUT EXECUTE
+  D736   0000           SADDR	WORD	0
+  D738   2D             SWITCH	BYTE	'-'
+  D739   00             	EVEN
                         
-  D5C2   0201 D596      ICMD	LI	R1,ICLIST
-  D5C6   0204 0280      	LI	R4,FCB
-  D5CA   0205 0005      	LI	R5,CMDCNT
-  D5CE   9C74           ICMD0	CB	*R4+,*R1+
-  D5D0   13FE           	JEQ	ICMD0
-  D5D2   0601           	DEC	R1
-  D5D4   0604           	DEC	R4
-  D5D6   9814 D015      	CB	*R4,@SPACE
-  D5DA   1B09           	JH	ICMD1
-  D5DC   D011           	MOVB	*R1,R0
-  D5DE   1607           	JNE	ICMD1
-  D5E0   0581           	INC	R1
-  D5E2   D0B1           	MOVB	*R1+,R2
-  D5E4   06C2           	SWPB	R2
-  D5E6   D0B1           	MOVB	*R1+,R2
-  D5E8   06C2           	SWPB	R2
-  D5EA   C03A           	MOV	*SP+,R0
-  D5EC   0452           	B	*R2
-  D5EE   0605           ICMD1	DEC	R5
-  D5F0   1306           	JEQ	ICMDE
-  D5F2   D031           ICMD2	MOVB	*R1+,R0
-  D5F4   16FE           	JNE	ICMD2
-  D5F6   05C1           	INCT	R1
-  D5F8   0204 0280      	LI	R4,FCB
-  D5FC   10E8           	JMP	ICMD0
-  D5FE   2DC0           ICMDE	RET
+  D73A   0201 D70E      ICMD	LI	R1,ICLIST
+  D73E   0204 0280      	LI	R4,FCB
+  D742   0205 0005      	LI	R5,CMDCNT
+  D746   9C74           ICMD0	CB	*R4+,*R1+
+  D748   13FE           	JEQ	ICMD0
+  D74A   0601           	DEC	R1
+  D74C   0604           	DEC	R4
+  D74E   9814 D015      	CB	*R4,@SPACE
+  D752   1B09           	JH	ICMD1
+  D754   D011           	MOVB	*R1,R0
+  D756   1607           	JNE	ICMD1
+  D758   0581           	INC	R1
+  D75A   D0B1           	MOVB	*R1+,R2
+  D75C   06C2           	SWPB	R2
+  D75E   D0B1           	MOVB	*R1+,R2
+  D760   06C2           	SWPB	R2
+  D762   C03A           	MOV	*SP+,R0
+  D764   0452           	B	*R2
+  D766   0605           ICMD1	DEC	R5
+  D768   1306           	JEQ	ICMDE
+  D76A   D031           ICMD2	MOVB	*R1+,R0
+  D76C   16FE           	JNE	ICMD2
+  D76E   05C1           	INCT	R1
+  D770   0204 0280      	LI	R4,FCB
+  D774   10E8           	JMP	ICMD0
+  D776   2DC0           ICMDE	RET
                         
                         ;*******************************************************************
                         ;	DIR
                         ;*******************************************************************
-  D600   203A 20        BAR	TEXT	' : '
-  D603   00             	BYTE	0
-  D604   0D0A 00        CRLF	BYTE	0DH,0AH,0
-  D607   4E4F 2046      MNOFILE	TEXT	'NO FILES'
-  D60B   494C 4553      
-  D60F   0D0A 00        	BYTE	0DH,0AH,0
-  D612                  	EVEN
-  D612   0000           CCOUNT	WORD	0
-  D614                  	EVEN
+  D778   203A 20        BAR	TEXT	' : '
+  D77B   00             	BYTE	0
+  D77C   0D0A 00        CRLF	BYTE	0DH,0AH,0
+  D77F   4E4F 2046      MNOFILE	TEXT	'NO FILES'
+  D783   494C 4553      
+  D787   0D0A 00        	BYTE	0DH,0AH,0
+  D78A                  	EVEN
+  D78A   0000           CCOUNT	WORD	0
+  D78C                  	EVEN
                         
-  D614   0200 0001      DSKDIR:	LI	R0,1
-  D618   C800 D612      	MOV	R0,@CCOUNT
-  D61C   0201 3F00      	LI	R1,'?'*256
-  D620   0200 000B      	LI	R0,NAMSIZ
-  D624   0208 0280      	LI	R8,FCB
-  D628   C088           	MOV	R8,R2
-  D62A   DC81           DSKDIR0	MOVB	R1,*R2+
-  D62C   0600           	DEC	R0
-  D62E   16FD           	JNE	DSKDIR0
-  D630   0202 0011      	LI	R2,SEARCH1
-  D634   0203 0280      	LI	R3,FCB
-  D638   2DA0 E400      	CALL	@BDOS
-  D63C   C041           	MOV	R1,R1
-  D63E   1134           	JLT	NOFILE
-  D640   2DA0 D65A      	CALL	@PNAME
-  D644   0202 0012      DSKDIR1	LI	R2,SEARCH2
-  D648   0203 0280      	LI	R3,FCB
-  D64C   2DA0 E400      	CALL	@BDOS
-  D650   C041           	MOV	R1,R1
-  D652   1125           	JLT	DIREXIT
-  D654   2DA0 D65A      	CALL	@PNAME
-  D658   10F5           	JMP	DSKDIR1
+  D78C   0200 0001      DSKDIR:	LI	R0,1
+  D790   C800 D78A      	MOV	R0,@CCOUNT
+  D794   0201 3F00      	LI	R1,'?'*256
+  D798   0200 000B      	LI	R0,NAMSIZ
+  D79C   0208 0280      	LI	R8,FCB
+  D7A0   C088           	MOV	R8,R2
+  D7A2   DC81           DSKDIR0	MOVB	R1,*R2+
+  D7A4   0600           	DEC	R0
+  D7A6   16FD           	JNE	DSKDIR0
+  D7A8   0202 0011      	LI	R2,SEARCH1
+  D7AC   0203 0280      	LI	R3,FCB
+  D7B0   2DA0 E400      	CALL	@BDOS
+  D7B4   C041           	MOV	R1,R1
+  D7B6   1134           	JLT	NOFILE
+  D7B8   2DA0 D7D2      	CALL	@PNAME
+  D7BC   0202 0012      DSKDIR1	LI	R2,SEARCH2
+  D7C0   0203 0280      	LI	R3,FCB
+  D7C4   2DA0 E400      	CALL	@BDOS
+  D7C8   C041           	MOV	R1,R1
+  D7CA   1125           	JLT	DIREXIT
+  D7CC   2DA0 D7D2      	CALL	@PNAME
+  D7D0   10F5           	JMP	DSKDIR1
                         
-  D65A   0620 D612      PNAME	DEC	@CCOUNT
-  D65E   1606           	JNE	PNAME1
-  D660   2FA0 D604      	MESG	@CRLF
-  D664   0201 0001      	LI	R1,1
-  D668   C801 D612      	MOV	R1,@CCOUNT
-  D66C   C043           PNAME1	MOV	R3,R1
-  D66E   0200 000B      	LI	R0,NAMSIZ
-  D672   064A           PNAME2	DECT	SP
-  D674   C680           	MOV	R0,*SP
-  D676   D0F1           	MOVB	*R1+,R3
-  D678   06C3           	SWPB	R3
-  D67A   064A           	DECT	SP
-  D67C   C681           	MOV	R1,*SP
-  D67E   0202 0002      	LI	R2,COUT
-  D682   2DA0 E400      	CALL	@BDOS
-  D686   C07A           	MOV	*SP+,R1
-  D688   C03A           	MOV	*SP+,R0
-  D68A   0600           	DEC	R0
-  D68C   16F2           	JNE	PNAME2
-  D68E   C020 D612      	MOV	@CCOUNT,R0
-  D692   0280 0001      	CI	R0,1
-  D696   1302           	JEQ	PNAME3
-  D698   2FA0 D604      	MESG	@CRLF
-  D69C   2DC0           PNAME3	RET
+  D7D2   0620 D78A      PNAME	DEC	@CCOUNT
+  D7D6   1606           	JNE	PNAME1
+  D7D8   2FA0 D77C      	MESG	@CRLF
+  D7DC   0201 0001      	LI	R1,1
+  D7E0   C801 D78A      	MOV	R1,@CCOUNT
+  D7E4   C043           PNAME1	MOV	R3,R1
+  D7E6   0200 000B      	LI	R0,NAMSIZ
+  D7EA   064A           PNAME2	DECT	SP
+  D7EC   C680           	MOV	R0,*SP
+  D7EE   D0F1           	MOVB	*R1+,R3
+  D7F0   06C3           	SWPB	R3
+  D7F2   064A           	DECT	SP
+  D7F4   C681           	MOV	R1,*SP
+  D7F6   0202 0002      	LI	R2,COUT
+  D7FA   2DA0 E400      	CALL	@BDOS
+  D7FE   C07A           	MOV	*SP+,R1
+  D800   C03A           	MOV	*SP+,R0
+  D802   0600           	DEC	R0
+  D804   16F2           	JNE	PNAME2
+  D806   C020 D78A      	MOV	@CCOUNT,R0
+  D80A   0280 0001      	CI	R0,1
+  D80E   1302           	JEQ	PNAME3
+  D810   2FA0 D77C      	MESG	@CRLF
+  D814   2DC0           PNAME3	RET
                         
-  D69E   2FA0 D604      DIREXIT	MESG	@CRLF
-  D6A2   04C1           	CLR	R1
-  D6A4   0460 D4C2      	B	@RETURN
-  D6A8   2FA0 D607      NOFILE	MESG	@MNOFILE
-  D6AC   04C1           	CLR	R1
-  D6AE   0460 DB92      	B	@CMDERR
+  D816   2FA0 D77C      DIREXIT	MESG	@CRLF
+  D81A   04C1           	CLR	R1
+  D81C   0460 D63A      	B	@RETURN
+  D820   2FA0 D77F      NOFILE	MESG	@MNOFILE
+  D824   04C1           	CLR	R1
+  D826   0460 DD4C      	B	@CMDERR
                         
                         ;*******************************************************************
                         ;	SAVE
                         ;*******************************************************************
   00A0                  CMDPTR	EQU	0A0H
-  D6B2   0460 D824      PARSERR	B	@PARSMSG
+  D82A   0460 D99C      PARSERR	B	@PARSMSG
                         
-  D6B6   04E0 D5B8      DSKSAVE:	CLR	@BUFPNT
-  D6BA   04E0 D5BA      	CLR	@RECCNT
-  D6BE   0203 0500      	LI	R3,TPA
-  D6C2   C803 D5BE      	MOV	R3,@SADDR
-  D6C6   0203 0250      	LI	R3,CMDLINE
-  D6CA   9833 D015      START00	CB	*R3+,@SPACE
-  D6CE   1BFD           	JH	START00
-  D6D0   0603           	DEC	R3
-  D6D2   9813 D018      START02	CB	*R3,@CR
-  D6D6   13ED           	JEQ	PARSERR
-  D6D8   9833 D015      	CB	*R3+,@SPACE
-  D6DC   12FA           	JLE	START02
-  D6DE   0603           	DEC	R3
-  D6E0   C803 D5B8      	MOV	R3,@BUFPNT
-  D6E4   2DA0 D954      	CALL	@ATOD
-  D6E8   C041           	MOV	R1,R1
-  D6EA   13E3           	JEQ	PARSERR
-  D6EC   C801 D5BA      	MOV	R1,@RECCNT
-  D6F0   C0E0 D5B8      	MOV	@BUFPNT,R3
-  D6F4   9813 D018      PREPARSE	CB	*R3,@CR
-  D6F8   13DC           	JEQ	PARSERR
-  D6FA   9833 D015      	CB	*R3+,@SPACE
-  D6FE   12FA           	JLE	PREPARSE
-  D700   0603           	DEC	R3
-  D702   2DA0 D1BA      	CALL	@PARSENAME
-  D706   9833 D015      NAM2	CB	*R3+,@SPACE
-  D70A   13FD           	JEQ	NAM2
-  D70C   0603           	DEC	R3
-  D70E   9813 D018      	CB	*R3,@CR
-  D712   130B           	JEQ	NAMSRCH
-  D714   9833 D5C0      	CB	*R3+,@SWITCH
-  D718   16CC           	JNE	PARSERR
-  D71A   C803 D5B8      	MOV	R3,@BUFPNT
-  D71E   2DA0 D980      	CALL	@CATOH
-  D722   C041           	MOV	R1,R1
-  D724   13C6           	JEQ	PARSERR
-  D726   C801 D5BE      	MOV	R1,@SADDR
-  D72A   0202 0011      NAMSRCH	LI	R2,SEARCH1
-  D72E   0203 0280      	LI	R3,FCB
-  D732   2DA0 E400      	CALL	@BDOS
-  D736   C041           	MOV	R1,R1
-  D738   1106           	JLT	NAM5
-  D73A   0202 0013      NAM3	LI	R2,ERAFIL
-  D73E   0203 0280      	LI	R3,FCB
-  D742   2DA0 E400      	CALL	@BDOS
-  D746   0202 0016      NAM5	LI	R2,MAKFIL
-  D74A   0203 0280      	LI	R3,FCB
-  D74E   2DA0 E400      	CALL	@BDOS
-  D752   C041           	MOV	R1,R1
-  D754   1402           	JHE	SKMK1
-  D756   0460 D814      	B	@MKERR
+  D82E   04E0 D730      DSKSAVE:	CLR	@BUFPNT
+  D832   04E0 D732      	CLR	@RECCNT
+  D836   0203 0500      	LI	R3,TPA
+  D83A   C803 D736      	MOV	R3,@SADDR
+  D83E   0203 0250      	LI	R3,CMDLINE
+  D842   9833 D015      START00	CB	*R3+,@SPACE
+  D846   1BFD           	JH	START00
+  D848   0603           	DEC	R3
+  D84A   9813 D018      START02	CB	*R3,@CR
+  D84E   13ED           	JEQ	PARSERR
+  D850   9833 D015      	CB	*R3+,@SPACE
+  D854   12FA           	JLE	START02
+  D856   0603           	DEC	R3
+  D858   C803 D730      	MOV	R3,@BUFPNT
+  D85C   2DA0 DB10      	CALL	@ATOD
+  D860   C041           	MOV	R1,R1
+  D862   13E3           	JEQ	PARSERR
+  D864   C801 D732      	MOV	R1,@RECCNT
+  D868   C0E0 D730      	MOV	@BUFPNT,R3
+  D86C   9813 D018      PREPARSE	CB	*R3,@CR
+  D870   13DC           	JEQ	PARSERR
+  D872   9833 D015      	CB	*R3+,@SPACE
+  D876   12FA           	JLE	PREPARSE
+  D878   0603           	DEC	R3
+  D87A   2DA0 D1C2      	CALL	@PARSENAME
+  D87E   9833 D015      NAM2	CB	*R3+,@SPACE
+  D882   13FD           	JEQ	NAM2
+  D884   0603           	DEC	R3
+  D886   9813 D018      	CB	*R3,@CR
+  D88A   130B           	JEQ	NAMSRCH
+  D88C   9833 D738      	CB	*R3+,@SWITCH
+  D890   16CC           	JNE	PARSERR
+  D892   C803 D730      	MOV	R3,@BUFPNT
+  D896   2DA0 DB3C      	CALL	@CATOH
+  D89A   C041           	MOV	R1,R1
+  D89C   13C6           	JEQ	PARSERR
+  D89E   C801 D736      	MOV	R1,@SADDR
+  D8A2   0202 0011      NAMSRCH	LI	R2,SEARCH1
+  D8A6   0203 0280      	LI	R3,FCB
+  D8AA   2DA0 E400      	CALL	@BDOS
+  D8AE   C041           	MOV	R1,R1
+  D8B0   1106           	JLT	NAM5
+  D8B2   0202 0013      NAM3	LI	R2,ERAFIL
+  D8B6   0203 0280      	LI	R3,FCB
+  D8BA   2DA0 E400      	CALL	@BDOS
+  D8BE   0202 0016      NAM5	LI	R2,MAKFIL
+  D8C2   0203 0280      	LI	R3,FCB
+  D8C6   2DA0 E400      	CALL	@BDOS
+  D8CA   C041           	MOV	R1,R1
+  D8CC   1402           	JHE	SKMK1
+  D8CE   0460 D98C      	B	@MKERR
                         SKMK1:
-  D75A   0204 0280      	LI	R4,FCB
-  D75E   C0E0 D5BE      	MOV	@SADDR,R3
-  D762   C903 0010      	MOV	R3,@FLA(R4)
-  D766   04E4 001A      	CLR	@CRN(R4)
-  D76A   064A           WRDATA	DECT	SP
-  D76C   C683           	MOV	R3,*SP
-  D76E   0202 001A      	LI	R2,SETDMA
-  D772   2DA0 E400      	CALL	@BDOS
-  D776   0202 0015      	LI	R2,WRSEQ
-  D77A   0203 0280      	LI	R3,FCB
-  D77E   2DA0 E400      	CALL	@BDOS
-  D782   C0FA           	MOV	*SP+,R3
-  D784   C041           	MOV	R1,R1
-  D786   1402           	JHE	SKWR1
-  D788   0460 D80E      	B	@WRITERR
+  D8D2   0204 0280      	LI	R4,FCB
+  D8D6   C0E0 D736      	MOV	@SADDR,R3
+  D8DA   C903 0010      	MOV	R3,@FLA(R4)
+  D8DE   04E4 001A      	CLR	@CRN(R4)
+  D8E2   064A           WRDATA	DECT	SP
+  D8E4   C683           	MOV	R3,*SP
+  D8E6   0202 001A      	LI	R2,SETDMA
+  D8EA   2DA0 E400      	CALL	@BDOS
+  D8EE   0202 0015      	LI	R2,WRSEQ
+  D8F2   0203 0280      	LI	R3,FCB
+  D8F6   2DA0 E400      	CALL	@BDOS
+  D8FA   C0FA           	MOV	*SP+,R3
+  D8FC   C041           	MOV	R1,R1
+  D8FE   1402           	JHE	SKWR1
+  D900   0460 D986      	B	@WRITERR
                         SKWR1:
-  D78C   8803 00B0      	C	R3,@MEMLIMIT
-  D790   1A02           	JL	SKLG1
-  D792   0460 D82C      	B	@LARGERR
+  D904   8803 00B0      	C	R3,@MEMLIMIT
+  D908   1A02           	JL	SKLG1
+  D90A   0460 D9A4      	B	@LARGERR
                         SKLG1:
-  D796   0223 0200      	AI	R3,BYTSEC
-  D79A   0620 D5BA      	DEC	@RECCNT
-  D79E   16E5           	JNE	WRDATA
-  D7A0   0202 0010      WRDATAC	LI	R2,FCLOSE
-  D7A4   0203 0280      	LI	R3,FCB
-  D7A8   2DA0 E400      	CALL	@BDOS
-  D7AC   04C1           EXIT	CLR	R1
-  D7AE   0460 D4C2      	B	@RETURN
+  D90E   0223 0200      	AI	R3,BYTSEC
+  D912   0620 D732      	DEC	@RECCNT
+  D916   16E5           	JNE	WRDATA
+  D918   0202 0010      WRDATAC	LI	R2,FCLOSE
+  D91C   0203 0280      	LI	R3,FCB
+  D920   2DA0 E400      	CALL	@BDOS
+  D924   04C1           EXIT	CLR	R1
+  D926   0460 D63A      	B	@RETURN
                         
                         ;*******************************************************************
                         ;	ERASE
                         ;*******************************************************************
-  D7B2   0460 D824      ERAPERR	B	@PARSMSG
+  D92A   0460 D99C      ERAPERR	B	@PARSMSG
                         
-  D7B6   04E0 D5BA      ERAFILE	CLR	@RECCNT
-  D7BA   04E0 D5B8      	CLR	@BUFPNT
-  D7BE   0203 0500      	LI	R3,TPA
-  D7C2   C803 D5BE      	MOV	R3,@SADDR
-  D7C6   0203 0250      	LI	R3,CMDLINE
-  D7CA   9833 D015      ERA0	CB	*R3+,@SPACE
-  D7CE   1BFD           	JH	ERA0
-  D7D0   0603           	DEC	R3
-  D7D2   9813 D018      ERA01	CB	*R3,@CR
-  D7D6   13ED           	JEQ	ERAPERR
-  D7D8   9833 D015      	CB	*R3+,@SPACE
-  D7DC   12FA           	JLE	ERA01
-  D7DE   0603           	DEC	R3
-  D7E0   2DA0 D1BA      	CALL	@PARSENAME
-  D7E4   0202 0011      ERA4	LI	R2,SEARCH1
-  D7E8   0203 0280      	LI	R3,FCB
-  D7EC   2DA0 E400      	CALL	@BDOS
-  D7F0   C041           	MOV	R1,R1
-  D7F2   110A           	JLT	ERAE
-  D7F4   0202 0013      	LI	R2,ERAFIL
-  D7F8   0203 0280      	LI	R3,FCB
-  D7FC   2DA0 E400      	CALL	@BDOS
-  D800   C041           	MOV	R1,R1
-  D802   1402           	JHE	SKMK2
-  D804   0460 D832      	B	@MKERR2
+  D92E   04E0 D732      ERAFILE	CLR	@RECCNT
+  D932   04E0 D730      	CLR	@BUFPNT
+  D936   0203 0500      	LI	R3,TPA
+  D93A   C803 D736      	MOV	R3,@SADDR
+  D93E   0203 0250      	LI	R3,CMDLINE
+  D942   9833 D015      ERA0	CB	*R3+,@SPACE
+  D946   1BFD           	JH	ERA0
+  D948   0603           	DEC	R3
+  D94A   9813 D018      ERA01	CB	*R3,@CR
+  D94E   13ED           	JEQ	ERAPERR
+  D950   9833 D015      	CB	*R3+,@SPACE
+  D954   12FA           	JLE	ERA01
+  D956   0603           	DEC	R3
+  D958   2DA0 D1C2      	CALL	@PARSENAME
+  D95C   0202 0011      ERA4	LI	R2,SEARCH1
+  D960   0203 0280      	LI	R3,FCB
+  D964   2DA0 E400      	CALL	@BDOS
+  D968   C041           	MOV	R1,R1
+  D96A   110A           	JLT	ERAE
+  D96C   0202 0013      	LI	R2,ERAFIL
+  D970   0203 0280      	LI	R3,FCB
+  D974   2DA0 E400      	CALL	@BDOS
+  D978   C041           	MOV	R1,R1
+  D97A   1402           	JHE	SKMK2
+  D97C   0460 D9AA      	B	@MKERR2
                         SKMK2:
-  D808   04C1           ERAE	CLR	R1
-  D80A   0460 D4C2      	B	@RETURN
+  D980   04C1           ERAE	CLR	R1
+  D982   0460 D63A      	B	@RETURN
                         
                         ;*******************************************************************
                         ;	Error handlers
                         ;*******************************************************************
-  D80E   2FA0 D9E7      WRITERR	MESG	@ERRMSG4
-  D812   100F           	JMP	MKERR2
-  D814   0460 F000      MKERR	B	@MONITOR
-  D818   2FA0 D9D8      	MESG	@ERRMSG3
-  D81C   100A           	JMP	MKERR2
-  D81E   2FA0 D9B8      CLOSERR	MESG	@ERRMSG1
-  D822   1007           	JMP	MKERR2
-  D824   2FA0 D9C8      PARSMSG	MESG	@ERRMSG2
-  D828   0460 D4EE      	B	@NEXTCMD
-  D82C   2FA0 D9F7      LARGERR	MESG	@ERRMSG5
-  D830   1000           	JMP	MKERR2
-  D832   0202 0010      MKERR2	LI	R2,FCLOSE
-  D836   0203 0280      	LI	R3,FCB
-  D83A   2DA0 E400      	CALL	@BDOS
-  D83E   0460 D4C2      	B	@RETURN
+  D986   2FA0 DBA3      WRITERR	MESG	@ERRMSG4
+  D98A   100F           	JMP	MKERR2
+  D98C   0460 F000      MKERR	B	@MONITOR
+  D990   2FA0 DB94      	MESG	@ERRMSG3
+  D994   100A           	JMP	MKERR2
+  D996   2FA0 DB74      CLOSERR	MESG	@ERRMSG1
+  D99A   1007           	JMP	MKERR2
+  D99C   2FA0 DB84      PARSMSG	MESG	@ERRMSG2
+  D9A0   0460 D666      	B	@NEXTCMD
+  D9A4   2FA0 DBB3      LARGERR	MESG	@ERRMSG5
+  D9A8   1000           	JMP	MKERR2
+  D9AA   0202 0010      MKERR2	LI	R2,FCLOSE
+  D9AE   0203 0280      	LI	R3,FCB
+  D9B2   2DA0 E400      	CALL	@BDOS
+  D9B6   0460 D63A      	B	@RETURN
                         
                         ;*******************************************************************
                         ;	TYPE
@@ -1186,562 +1509,600 @@
                         ;*******************************************************************
                         DOLOAD:
                         	;--- SKIP 'LOAD', PARSE OVERLAY FILENAME ---
-  D842   0203 0250      	LI	R3,CMDLINE
-  D846   9833 D015      DLSK1	CB	*R3+,@SPACE		;SKIP COMMAND NAME
-  D84A   1BFD           	JH	DLSK1
-  D84C   0603           	DEC	R3
-  D84E   9813 D018      DLSK2	CB	*R3,@CR			;END OF LINE?
-  D852   136D           	JEQ	DLERR
-  D854   9833 D015      	CB	*R3+,@SPACE		;SKIP SPACES
-  D858   12FA           	JLE	DLSK2
-  D85A   0603           	DEC	R3
-  D85C   2DA0 D1BA      	CALL	@PARSENAME		;FCB = OVERLAY NAME+EXT
+  D9BA   0203 0250      	LI	R3,CMDLINE
+  D9BE   9833 D015      DLSK1	CB	*R3+,@SPACE		;SKIP COMMAND NAME
+  D9C2   1BFD           	JH	DLSK1
+  D9C4   0603           	DEC	R3
+  D9C6   9813 D018      DLSK2	CB	*R3,@CR			;END OF LINE?
+  D9CA   1602           	JNE	DLSK_E
+  D9CC   0460 DADC      	B	@DLERR
+  D9D0   9833 D015      DLSK_E	CB	*R3+,@SPACE		;SKIP SPACES
+  D9D4   12F8           	JLE	DLSK2
+  D9D6   0603           	DEC	R3
+  D9D8   2DA0 D1C2      	CALL	@PARSENAME		;FCB = OVERLAY NAME+EXT
                         
                         	;--- OPEN FILE ---
-  D860   0204 0280      	LI	R4,FCB
-  D864   04E4 001A      	CLR	@CRN(R4)
-  D868   0202 000F      	LI	R2,FOPEN
-  D86C   0203 0280      	LI	R3,FCB
-  D870   2DA0 E400      	CALL	@BDOS
-  D874   C041           	MOV	R1,R1
-  D876   115B           	JLT	DLERR
+  D9DC   0204 0280      	LI	R4,FCB
+  D9E0   04E4 001A      	CLR	@CRN(R4)
+  D9E4   0202 000F      	LI	R2,FOPEN
+  D9E8   0203 0280      	LI	R3,FCB
+  D9EC   2DA0 E400      	CALL	@BDOS
+  D9F0   C041           	MOV	R1,R1
+  D9F2   1402           	JHE	DLSK_F
+  D9F4   0460 DADC      	B	@DLERR
+                        DLSK_F
                         
                         	;--- READ FIRST SECTOR ---
-  D878   0203 0500      	LI	R3,STAGING
-  D87C   0202 001A      	LI	R2,SETDMA
-  D880   2DA0 E400      	CALL	@BDOS
-  D884   0202 0014      	LI	R2,RDSEQ
-  D888   0203 0280      	LI	R3,FCB
-  D88C   2DA0 E400      	CALL	@BDOS
-  D890   0281 FFFF      	CI	R1,-1
-  D894   134C           	JEQ	DLERR
+  D9F8   0203 0500      	LI	R3,STAGING
+  D9FC   0202 001A      	LI	R2,SETDMA
+  DA00   2DA0 E400      	CALL	@BDOS
+  DA04   0202 0014      	LI	R2,RDSEQ
+  DA08   0203 0280      	LI	R3,FCB
+  DA0C   2DA0 E400      	CALL	@BDOS
+  DA10   0281 FFFF      	CI	R1,-1
+  DA14   1602           	JNE	DLSK_G
+  DA16   0460 DADC      	B	@DLERR
+                        DLSK_G
                         
-                        	;--- CHECK PAGEMAP HEADER ---
-  D896   0206 0500      	LI	R6,STAGING
-  D89A   C016           	MOV	*R6,R0
-  D89C   0280 FFFF      	CI	R0,0FFFFH
-  D8A0   1646           	JNE	DLERR
-  D8A2   0226 0006      	AI	R6,6			;SKIP OPENING SENTINEL
+                        	;--- PROCESS CHAIN BLOCKS ---
+                        	; Header: next_offset(w) page(w) start(w) size(w) [data]
+  DA1A   0206 0500      	LI	R6,STAGING			; CURRENT POINTER
+  DA1E   0208 0700      	LI	R8,STAGING_END			; END OF STAGING
                         
-                        	;--- WALK PAGEMAP ENTRIES ---
-  D8A6   C016           DLPM	MOV	*R6,R0
-  D8A8   0280 FFFF      	CI	R0,0FFFFH
-  D8AC   130B           	JEQ	DLSENT			;CLOSING SENTINEL
-  D8AE   C1F6           	MOV	*R6+,R7			;START ADDRESS
-  D8B0   C076           	MOV	*R6+,R1			;END (UNUSED)
-  D8B2   C136           	MOV	*R6+,R4			;PAGE NUMBER
-  D8B4   C004           	MOV	R4,R0
-  D8B6   13F7           	JEQ	DLPM			;PAGE 0 = SKIP
-  D8B8   C247           	MOV	R7,R9
-  D8BA   09C9           	SRL	R9,12			;SEGMENT = ADDR>>12
-  D8BC   C004           	MOV	R4,R0
-  D8BE   06A0 DE9A      	BL	@MAP_SET
-  D8C2   10F1           	JMP	DLPM
+                        DLBLK:
+  DA22   C1C6           	MOV	R6,R7				; R7 = HEADER START
+  DA24   C176           	MOV	*R6+,R5				; R5 = NEXT_OFFSET
+  DA26   C136           	MOV	*R6+,R4				; R4 = PAGE
+  DA28   C0B6           	MOV	*R6+,R2				; R2 = START (DESTINATION)
+  DA2A   C0F6           	MOV	*R6+,R3				; R3 = SIZE IN BYTES
                         
-                        	;--- LOAD BLOCK ---
-  D8C4   0226 0006      DLSENT	AI	R6,6			;SKIP CLOSING SENTINEL
-  D8C8   C176           	MOV	*R6+,R5			;BLOCK SIZE (BYTES)
-  D8CA   0915           	SRL	R5,1			;TO WORDS
-  D8CC   C087           	MOV	R7,R2			;DESTINATION
-  D8CE   0209 0100      	LI	R9,PSEL_EN
-  D8D2   2C89           	PSEL	R9			;ENABLE PSEL
-  D8D4   C046           	MOV	R6,R1			;SOURCE IN STAGING
-  D8D6   0204 0700      	LI	R4,STAGING+512		;END OF STAGING
-  D8DA   CCB1           DLCPY	MOV	*R1+,*R2+
-  D8DC   0605           	DEC	R5
-  D8DE   1321           	JEQ	DLDONE
-  D8E0   8101           	C	R1,R4
-  D8E2   1AFB           	JL	DLCPY
+                        	;--- MAP_SET IF PAGED ---
+  DA2C   C004           	MOV	R4,R0
+  DA2E   1304           	JEQ	DLCPY_S				; PAGE 0 = NO MAP_SET
+  DA30   C242           	MOV	R2,R9
+  DA32   09C9           	SRL	R9,12				; SEGMENT = START>>12
+  DA34   06A0 E054      	BL	@MAP_SET			; R9=SEGMENT R0=PAGE
                         
-                        	;--- NEXT SECTOR ---
-  D8E4   064A           	DECT	SP
-  D8E6   C682           	MOV	R2,*SP
-  D8E8   064A           	DECT	SP
-  D8EA   C685           	MOV	R5,*SP
-  D8EC   04C9           	CLR	R9
-  D8EE   2C89           	PSEL	R9			;DISABLE PSEL FOR BDOS
-  D8F0   0203 0500      	LI	R3,STAGING
-  D8F4   0202 001A      	LI	R2,SETDMA
-  D8F8   2DA0 E400      	CALL	@BDOS
-  D8FC   0202 0014      	LI	R2,RDSEQ
-  D900   0203 0280      	LI	R3,FCB
-  D904   2DA0 E400      	CALL	@BDOS
-  D908   C17A           	MOV	*SP+,R5
-  D90A   C0BA           	MOV	*SP+,R2
-  D90C   0281 FFFF      	CI	R1,-1
-  D910   1308           	JEQ	DLDONE
-  D912   0209 0100      	LI	R9,PSEL_EN
-  D916   2C89           	PSEL	R9
-  D918   0201 0500      	LI	R1,STAGING
-  D91C   0204 0700      	LI	R4,STAGING+512
-  D920   10DC           	JMP	DLCPY
+                        DLCPY_S:
+  DA38   0209 0100      	LI	R9,PSEL_EN
+  DA3C   2C89           	PSEL	R9				; PSEL ON
+  DA3E   0913           	SRL	R3,1				; BYTES TO WORDS
+                        DLCPY:
+  DA40   CCB6           	MOV	*R6+,*R2+			; COPY WORD
+  DA42   0603           	DEC	R3
+  DA44   1327           	JEQ	DLDONE_B			; BLOCK DONE
+  DA46   8206           	C	R6,R8
+  DA48   1AFB           	JL	DLCPY
                         
-  D922   04C9           DLDONE	CLR	R9
-  D924   2C89           	PSEL	R9			;DISABLE PSEL
-  D926   2FA0 D936      	MESG	@DLTXT_OK
-  D92A   0460 D4EE      	B	@NEXTCMD
+                        	;--- STAGING EXHAUSTED - RELOAD ---
+  DA4A   04C9           	CLR	R9
+  DA4C   2C89           	PSEL	R9				; PSEL OFF
+  DA4E   064A           	DECT	SP
+  DA50   C687           	MOV	R7,*SP				; SAVE HEADER START
+  DA52   064A           	DECT	SP
+  DA54   C685           	MOV	R5,*SP				; SAVE NEXT_OFFSET
+  DA56   064A           	DECT	SP
+  DA58   C683           	MOV	R3,*SP				; SAVE WORD COUNT
+  DA5A   064A           	DECT	SP
+  DA5C   C682           	MOV	R2,*SP				; SAVE DESTINATION
+  DA5E   0203 0500      	LI	R3,STAGING
+  DA62   0202 001A      	LI	R2,SETDMA
+  DA66   2DA0 E400      	CALL	@BDOS
+  DA6A   0202 0014      	LI	R2,RDSEQ
+  DA6E   0203 0280      	LI	R3,FCB
+  DA72   2DA0 E400      	CALL	@BDOS
+  DA76   C0BA           	MOV	*SP+,R2
+  DA78   C0FA           	MOV	*SP+,R3
+  DA7A   C17A           	MOV	*SP+,R5
+  DA7C   C1FA           	MOV	*SP+,R7
+  DA7E   0281 FFFF      	CI	R1,-1
+  DA82   1308           	JEQ	DLDONE_B			; EOF
+  DA84   0209 0100      	LI	R9,PSEL_EN
+  DA88   2C89           	PSEL	R9
+  DA8A   0206 0500      	LI	R6,STAGING
+  DA8E   0208 0700      	LI	R8,STAGING_END
+  DA92   10D6           	JMP	DLCPY
                         
-  D92E   2FA0 D940      DLERR	MESG	@DLTXT_ERR
-  D932   0460 D4EE      	B	@NEXTCMD
+                        DLDONE_B:
+  DA94   04C9           	CLR	R9
+  DA96   2C89           	PSEL	R9				; PSEL OFF
+  DA98   C145           	MOV	R5,R5
+  DA9A   131C           	JEQ	DLDONE				; NEXT_OFFSET=0: LAST BLOCK
+  DA9C   A1C5           	A	R5,R7
+  DA9E   C187           	MOV	R7,R6				; R6 = NEXT HEADER
+  DAA0   8206           	C	R6,R8
+  DAA2   1ABF           	JL	DLBLK				; IN STAGING
+                        	;--- NEXT HEADER BEYOND STAGING: RELOAD ---
+  DAA4   6188           	S	R8,R6				; OVERSHOOT
+  DAA6   064A           	DECT	SP
+  DAA8   C685           	MOV	R5,*SP
+  DAAA   064A           	DECT	SP
+  DAAC   C686           	MOV	R6,*SP				; SAVE OVERSHOOT
+  DAAE   0203 0500      	LI	R3,STAGING
+  DAB2   0202 001A      	LI	R2,SETDMA
+  DAB6   2DA0 E400      	CALL	@BDOS
+  DABA   0202 0014      	LI	R2,RDSEQ
+  DABE   0203 0280      	LI	R3,FCB
+  DAC2   2DA0 E400      	CALL	@BDOS
+  DAC6   C1BA           	MOV	*SP+,R6
+  DAC8   C17A           	MOV	*SP+,R5
+  DACA   0208 0700      	LI	R8,STAGING_END
+  DACE   0226 0500      	AI	R6,STAGING			; R6 = STAGING + OVERSHOOT
+  DAD2   10A7           	JMP	DLBLK
                         
-  D936   4C6F 6164      DLTXT_OK	TEXT	'Loaded'
-  D93A   6564           
-  D93C   0D0A 00        	BYTE	0DH,0AH,0
-  D93F   00             	EVEN
-  D940   2D2D 4C6F      DLTXT_ERR	TEXT	'--Load error'
-  D944   6164 2065      
-  D948   7272 6F72      
-  D94C   0D0A 00        	BYTE	0DH,0AH,0
-  D94F   00             	EVEN
+                        DLDONE:
+  DAD4   2FA0 DAE4      	MESG	@DLTXT_OK
+  DAD8   0460 D666      	B	@NEXTCMD
                         
-  D950   0460 D4C2      TYPEFILE:	B	@RETURN
+  DADC   2FA0 DAFC      DLERR	MESG	@DLTXT_ERR
+  DAE0   0460 D666      	B	@NEXTCMD
+                        
+  DAE4   4C6F 6164      DLTXT_OK	TEXT	'Loaded as overlay '
+  DAE8   6564 2061      
+  DAEC   7320 6F76      
+  DAF0   6572 6C61      
+  DAF4   7920           
+  DAF6   00             	BYTE	0
+  DAF7   00             	EVEN
+  DAF8   0D0A 00        DLTXT_CRLF	BYTE	0DH,0AH,0
+  DAFB   00             	EVEN
+  DAFC   2D2D 4C6F      DLTXT_ERR	TEXT	'--Load error'
+  DB00   6164 2065      
+  DB04   7272 6F72      
+  DB08   0D0A 00        	BYTE	0DH,0AH,0
+  DB0B   00             	EVEN
+                        
+  DB0C   0460 D63A      TYPEFILE:	B	@RETURN
                         
                         
                         ;*******************************************************************
                         ;	ASCII conversion utilities
                         ;*******************************************************************
-  D954   04C3           ATOD	CLR	R3
-  D956   0208 000A      	LI	R8,10
-  D95A   C020 D5B8      ATOD00	MOV	@BUFPNT,R0
-  D95E   D090           	MOVB	*R0,R2
-  D960   0982           	SRL	R2,8
-  D962   0222 FFD0      	AI	R2,-'0'
-  D966   1103           	JLT	ATOD03
-  D968   0282 000A      	CI	R2,10
-  D96C   1102           	JLT	ATOD04
-  D96E   C043           ATOD03	MOV	R3,R1
-  D970   2DC0           	RET
-  D972   C002           ATOD04	MOV	R2,R0
-  D974   C083           	MOV	R3,R2
-  D976   3888           	MPY	R8,R2
-  D978   A0C0           	A	R0,R3
-  D97A   05A0 D5B8      	INC	@BUFPNT
-  D97E   10ED           	JMP	ATOD00
+  DB10   04C3           ATOD	CLR	R3
+  DB12   0208 000A      	LI	R8,10
+  DB16   C020 D730      ATOD00	MOV	@BUFPNT,R0
+  DB1A   D090           	MOVB	*R0,R2
+  DB1C   0982           	SRL	R2,8
+  DB1E   0222 FFD0      	AI	R2,-'0'
+  DB22   1103           	JLT	ATOD03
+  DB24   0282 000A      	CI	R2,10
+  DB28   1102           	JLT	ATOD04
+  DB2A   C043           ATOD03	MOV	R3,R1
+  DB2C   2DC0           	RET
+  DB2E   C002           ATOD04	MOV	R2,R0
+  DB30   C083           	MOV	R3,R2
+  DB32   3888           	MPY	R8,R2
+  DB34   A0C0           	A	R0,R3
+  DB36   05A0 D730      	INC	@BUFPNT
+  DB3A   10ED           	JMP	ATOD00
                         
-  D980   04C2           CATOH	CLR	R2
-  D982   C020 D5B8      LOOP	MOV	@BUFPNT,R0
-  D986   04C1           	CLR	R1
-  D988   D050           	MOVB	*R0,R1
-  D98A   0281 3000      	CI	R1,'0'*256
-  D98E   1A12           	JL	NOTHEX
-  D990   0281 3900      	CI	R1,'9'*256
-  D994   1208           	JLE	GOTONE
-  D996   0281 4100      	CI	R1,'A'*256
-  D99A   1A0C           	JL	NOTHEX
-  D99C   0281 4600      	CI	R1,'F'*256
-  D9A0   1B09           	JH	NOTHEX
-  D9A2   0221 0900      	AI	R1,0900H
-  D9A6   0A41           GOTONE	SLA	R1,4
-  D9A8   09C1           	SRL	R1,12
-  D9AA   0A42           	SLA	R2,4
-  D9AC   A081           	A	R1,R2
-  D9AE   05A0 D5B8      	INC	@BUFPNT
-  D9B2   10E7           	JMP	LOOP
-  D9B4   C042           NOTHEX	MOV	R2,R1
-  D9B6   2DC0           	RET
+  DB3C   04C2           CATOH	CLR	R2
+  DB3E   C020 D730      LOOP	MOV	@BUFPNT,R0
+  DB42   04C1           	CLR	R1
+  DB44   D050           	MOVB	*R0,R1
+  DB46   0281 3000      	CI	R1,'0'*256
+  DB4A   1A12           	JL	NOTHEX
+  DB4C   0281 3900      	CI	R1,'9'*256
+  DB50   1208           	JLE	GOTONE
+  DB52   0281 4100      	CI	R1,'A'*256
+  DB56   1A0C           	JL	NOTHEX
+  DB58   0281 4600      	CI	R1,'F'*256
+  DB5C   1B09           	JH	NOTHEX
+  DB5E   0221 0900      	AI	R1,0900H
+  DB62   0A41           GOTONE	SLA	R1,4
+  DB64   09C1           	SRL	R1,12
+  DB66   0A42           	SLA	R2,4
+  DB68   A081           	A	R1,R2
+  DB6A   05A0 D730      	INC	@BUFPNT
+  DB6E   10E7           	JMP	LOOP
+  DB70   C042           NOTHEX	MOV	R2,R1
+  DB72   2DC0           	RET
                         
                         ;*******************************************************************
                         ;	Error messages
                         ;*******************************************************************
-  D9B8   2D2D 436C      ERRMSG1	TEXT	'--Close error'
-  D9BC   6F73 6520      
-  D9C0   6572 726F      
-  D9C4   72             
-  D9C5   0D0A 00        	BYTE	0DH,0AH,0
-  D9C8   2D2D 5061      ERRMSG2	TEXT	'--Parse error'
-  D9CC   7273 6520      
-  D9D0   6572 726F      
-  D9D4   72             
-  D9D5   0D0A 00        	BYTE	0DH,0AH,0
-  D9D8   2D2D 4D61      ERRMSG3	TEXT	'--Make error'
-  D9DC   6B65 2065      
-  D9E0   7272 6F72      
-  D9E4   0D0A 00        	BYTE	0DH,0AH,0
-  D9E7   2D2D 5772      ERRMSG4	TEXT	'--Write error'
-  D9EB   6974 6520      
-  D9EF   6572 726F      
-  D9F3   72             
-  D9F4   0D0A 00        	BYTE	0DH,0AH,0
-  D9F7   2D2D 4669      ERRMSG5	TEXT	'--File too large error'
-  D9FB   6C65 2074      
-  D9FF   6F6F 206C      
-  DA03   6172 6765      
-  DA07   2065 7272      
-  DA0B   6F72           
-  DA0D   0D0A 00        	BYTE	0DH,0AH,0
-  DA10                  	EVEN
+  DB74   2D2D 436C      ERRMSG1	TEXT	'--Close error'
+  DB78   6F73 6520      
+  DB7C   6572 726F      
+  DB80   72             
+  DB81   0D0A 00        	BYTE	0DH,0AH,0
+  DB84   2D2D 5061      ERRMSG2	TEXT	'--Parse error'
+  DB88   7273 6520      
+  DB8C   6572 726F      
+  DB90   72             
+  DB91   0D0A 00        	BYTE	0DH,0AH,0
+  DB94   2D2D 4D61      ERRMSG3	TEXT	'--Make error'
+  DB98   6B65 2065      
+  DB9C   7272 6F72      
+  DBA0   0D0A 00        	BYTE	0DH,0AH,0
+  DBA3   2D2D 5772      ERRMSG4	TEXT	'--Write error'
+  DBA7   6974 6520      
+  DBAB   6572 726F      
+  DBAF   72             
+  DBB0   0D0A 00        	BYTE	0DH,0AH,0
+  DBB3   2D2D 4669      ERRMSG5	TEXT	'--File too large error'
+  DBB7   6C65 2074      
+  DBBB   6F6F 206C      
+  DBBF   6172 6765      
+  DBC3   2065 7272      
+  DBC7   6F72           
+  DBC9   0D0A 00        	BYTE	0DH,0AH,0
+  DBCC                  	EVEN
                         
                         ;*******************************************************************
                         ;	PROCEDURE processing
                         ;*******************************************************************
-  DA10   0204 0040      PFETCH	LI	R4,CLSZ
-  DA14   C804 DCFE      	MOV	R4,@CMDBYTES
-  DA18   0204 0250      	LI	R4,CMDLINE
-  DA1C   C804 DCFC      	MOV	R4,@CMDADDR
-  DA20   04E0 DD0E      	CLR	@SUBFLAG
-  DA24   C120 DD70      PLOOP	MOV	@MCNT,R4
-  DA28   1626           	JNE	BUFMOVE
-  DA2A   C120 DD66      	MOV	@MFSZ,R4
-  DA2E   1321           	JEQ	PROCERR1
-  DA30   0203 0000      	LI	R3,DEFDRV
-  DA34   0202 000E      	LI	R2,SELDSK
-  DA38   2DA0 E400      	CALL	@BDOS
-  DA3C   0203 0300      	LI	R3,COMM_BUF
-  DA40   0202 001A      	LI	R2,SETDMA
-  DA44   2DA0 E400      	CALL	@BDOS
-  DA48   0203 0280      	LI	R3,FCB
-  DA4C   0202 0014      	LI	R2,RDSEQ
-  DA50   2DA0 E400      	CALL	@BDOS
-  DA54   C041           	MOV	R1,R1
-  DA56   110B           	JLT	PROCERR0
-  DA58   0201 0200      	LI	R1,BLKSIZ
-  DA5C   C801 DD70      	MOV	R1,@MCNT
-  DA60   0204 0300      	LI	R4,COMM_BUF
-  DA64   C804 DD72      	MOV	R4,@MADDR
-  DA68   0620 DD66      	DEC	@MFSZ
-  DA6C   1004           	JMP	BUFMOVE
-  DA6E   0460 DBA8      PROCERR0	B	@SHELLERR
-  DA72   0460 DBCA      PROCERR1	B	@UNPROC
+  DBCC   0204 0040      PFETCH	LI	R4,CLSZ
+  DBD0   C804 DEB8      	MOV	R4,@CMDBYTES
+  DBD4   0204 0250      	LI	R4,CMDLINE
+  DBD8   C804 DEB6      	MOV	R4,@CMDADDR
+  DBDC   04E0 DEC8      	CLR	@SUBFLAG
+  DBE0   C120 DF2A      PLOOP	MOV	@MCNT,R4
+  DBE4   1626           	JNE	BUFMOVE
+  DBE6   C120 DF20      	MOV	@MFSZ,R4
+  DBEA   1321           	JEQ	PROCERR1
+  DBEC   0203 0000      	LI	R3,DEFDRV
+  DBF0   0202 000E      	LI	R2,SELDSK
+  DBF4   2DA0 E400      	CALL	@BDOS
+  DBF8   0203 0300      	LI	R3,COMM_BUF
+  DBFC   0202 001A      	LI	R2,SETDMA
+  DC00   2DA0 E400      	CALL	@BDOS
+  DC04   0203 0280      	LI	R3,FCB
+  DC08   0202 0014      	LI	R2,RDSEQ
+  DC0C   2DA0 E400      	CALL	@BDOS
+  DC10   C041           	MOV	R1,R1
+  DC12   110B           	JLT	PROCERR0
+  DC14   0201 0200      	LI	R1,BLKSIZ
+  DC18   C801 DF2A      	MOV	R1,@MCNT
+  DC1C   0204 0300      	LI	R4,COMM_BUF
+  DC20   C804 DF2C      	MOV	R4,@MADDR
+  DC24   0620 DF20      	DEC	@MFSZ
+  DC28   1004           	JMP	BUFMOVE
+  DC2A   0460 DD62      PROCERR0	B	@SHELLERR
+  DC2E   0460 DD84      PROCERR1	B	@UNPROC
                         
-  DA76   C120 DD72      BUFMOVE	MOV	@MADDR,R4
-  DA7A   D074           	MOVB	*R4+,R1
-  DA7C   C804 DD72      	MOV	R4,@MADDR
-  DA80   0620 DD70      	DEC	@MCNT
-  DA84   064A           	DECT	SP
-  DA86   C681           	MOV	R1,*SP
-  DA88   C020 DD0E      	MOV	@SUBFLAG,R0
-  DA8C   1621           	JNE	PARMSUB
-  DA8E   C07A           	MOV	*SP+,R1
-  DA90   9801 D022      	CB	R1,@SUBMARK
-  DA94   1603           	JNE	BUFMOV2
-  DA96   0720 DD0E      	SETO	@SUBFLAG
-  DA9A   10C4           	JMP	PLOOP
-  DA9C   9801 D01B      BUFMOV2	CB	R1,@EOF
-  DAA0   1313           	JEQ	BUFMOV4
-  DAA2   9801 0000      	CB	R1,@PAD
-  DAA6   1310           	JEQ	BUFMOV4
-  DAA8   9801 D019      BUFMOV3	CB	R1,@LF
-  DAAC   13BB           	JEQ	PLOOP
-  DAAE   C120 DCFC      BUFPUT	MOV	@CMDADDR,R4
-  DAB2   D501           	MOVB	R1,*R4
-  DAB4   9801 D018      	CB	R1,@CR
-  DAB8   1332           	JEQ	PEOL
-  DABA   0584           	INC	R4
-  DABC   C804 DCFC      	MOV	R4,@CMDADDR
-  DAC0   0620 DCFE      	DEC	@CMDBYTES
-  DAC4   1303           	JEQ	MOVERR
-  DAC6   10AE           	JMP	PLOOP
-  DAC8   0460 DBCA      BUFMOV4	B	@UNPROC
-  DACC   0460 DB98      MOVERR	B	@LINERR
+  DC32   C120 DF2C      BUFMOVE	MOV	@MADDR,R4
+  DC36   D074           	MOVB	*R4+,R1
+  DC38   C804 DF2C      	MOV	R4,@MADDR
+  DC3C   0620 DF2A      	DEC	@MCNT
+  DC40   064A           	DECT	SP
+  DC42   C681           	MOV	R1,*SP
+  DC44   C020 DEC8      	MOV	@SUBFLAG,R0
+  DC48   1621           	JNE	PARMSUB
+  DC4A   C07A           	MOV	*SP+,R1
+  DC4C   9801 D022      	CB	R1,@SUBMARK
+  DC50   1603           	JNE	BUFMOV2
+  DC52   0720 DEC8      	SETO	@SUBFLAG
+  DC56   10C4           	JMP	PLOOP
+  DC58   9801 D01B      BUFMOV2	CB	R1,@EOF
+  DC5C   1313           	JEQ	BUFMOV4
+  DC5E   9801 0000      	CB	R1,@PAD
+  DC62   1310           	JEQ	BUFMOV4
+  DC64   9801 D019      BUFMOV3	CB	R1,@LF
+  DC68   13BB           	JEQ	PLOOP
+  DC6A   C120 DEB6      BUFPUT	MOV	@CMDADDR,R4
+  DC6E   D501           	MOVB	R1,*R4
+  DC70   9801 D018      	CB	R1,@CR
+  DC74   1332           	JEQ	PEOL
+  DC76   0584           	INC	R4
+  DC78   C804 DEB6      	MOV	R4,@CMDADDR
+  DC7C   0620 DEB8      	DEC	@CMDBYTES
+  DC80   1303           	JEQ	MOVERR
+  DC82   10AE           	JMP	PLOOP
+  DC84   0460 DD84      BUFMOV4	B	@UNPROC
+  DC88   0460 DD52      MOVERR	B	@LINERR
                         
-  DAD0   04E0 DD0E      PARMSUB	CLR	@SUBFLAG
-  DAD4   C07A           	MOV	*SP+,R1
-  DAD6   064A           	DECT	SP
-  DAD8   C681           	MOV	R1,*SP
-  DADA   0981           	SRL	R1,8
-  DADC   0221 FFE0      	AI	R1,0FFE0H
-  DAE0   1119           	JLT	NOSUB
-  DAE2   0281 000A      	CI	R1,10
-  DAE6   1516           	JGT	NOSUB
-  DAE8   C081           	MOV	R1,R2
-  DAEA   C07A           	MOV	*SP+,R1
-  DAEC   0204 DEA8      	LI	R4,PPTRS
-  DAF0   C0D4           SUBLOOP	MOV	*R4,R3
-  DAF2   1312           	JEQ	NULLPARM
-  DAF4   0602           	DEC	R2
-  DAF6   15FC           	JGT	SUBLOOP
-  DAF8   D053           SUBLOOP2	MOVB	*R3,R1
-  DAFA   9060 D015      	CB	@SPACE,R1
-  DAFE   1192           	JLT	PLOOP
-  DB00   0583           	INC	R3
-  DB02   C120 DCFC      	MOV	@CMDADDR,R4
-  DB06   DD01           	MOVB	R1,*R4+
-  DB08   C804 DCFC      	MOV	R4,@CMDADDR
-  DB0C   0620 DCFE      	DEC	@CMDBYTES
-  DB10   1343           	JEQ	LINERR
-  DB12   10F2           	JMP	SUBLOOP2
-  DB14   C07A           NOSUB	MOV	*SP+,R1
-  DB16   10C2           	JMP	BUFMOV2
-  DB18   0201 0A00      NULLPARM	LI	R1,0A00H
-  DB1C   10C5           	JMP	BUFMOV3
+  DC8C   04E0 DEC8      PARMSUB	CLR	@SUBFLAG
+  DC90   C07A           	MOV	*SP+,R1
+  DC92   064A           	DECT	SP
+  DC94   C681           	MOV	R1,*SP
+  DC96   0981           	SRL	R1,8
+  DC98   0221 FFE0      	AI	R1,0FFE0H
+  DC9C   1119           	JLT	NOSUB
+  DC9E   0281 000A      	CI	R1,10
+  DCA2   1516           	JGT	NOSUB
+  DCA4   C081           	MOV	R1,R2
+  DCA6   C07A           	MOV	*SP+,R1
+  DCA8   0204 E062      	LI	R4,PPTRS
+  DCAC   C0D4           SUBLOOP	MOV	*R4,R3
+  DCAE   1312           	JEQ	NULLPARM
+  DCB0   0602           	DEC	R2
+  DCB2   15FC           	JGT	SUBLOOP
+  DCB4   D053           SUBLOOP2	MOVB	*R3,R1
+  DCB6   9060 D015      	CB	@SPACE,R1
+  DCBA   1192           	JLT	PLOOP
+  DCBC   0583           	INC	R3
+  DCBE   C120 DEB6      	MOV	@CMDADDR,R4
+  DCC2   DD01           	MOVB	R1,*R4+
+  DCC4   C804 DEB6      	MOV	R4,@CMDADDR
+  DCC8   0620 DEB8      	DEC	@CMDBYTES
+  DCCC   1342           	JEQ	LINERR
+  DCCE   10F2           	JMP	SUBLOOP2
+  DCD0   C07A           NOSUB	MOV	*SP+,R1
+  DCD2   10C2           	JMP	BUFMOV2
+  DCD4   0201 0A00      NULLPARM	LI	R1,0A00H
+  DCD8   10C5           	JMP	BUFMOV3
                         
-  DB1E   D060 0250      PEOL	MOVB	@CMDLINE,R1
-  DB22   9060 D01C      	CB	@COMT,R1
-  DB26   1331           	JEQ	BPFETCH
-  DB28   9060 D020      	CB	@NOTE,R1
-  DB2C   1303           	JEQ	VIEW
-  DB2E   C060 DD0A      	MOV	@VSW,R1
-  DB32   1304           	JEQ	CKNSW
-  DB34   0204 0250      VIEW	LI	R4,CMDLINE
-  DB38   2DA0 DCEE      	CALL	@OUTSTR
-  DB3C   C060 DD0C      CKNSW	MOV	@NSW,R1
-  DB40   1624           	JNE	BPFETCH
-  DB42   D060 0250      	MOVB	@CMDLINE,R1
-  DB46   9060 D020      	CB	@NOTE,R1
-  DB4A   1621           	JNE	BTDOCMD
-  DB4C   0204 0250      	LI	R4,CMDLINE
-  DB50   0584           	INC	R4
-  DB52   9814 D020      	CB	*R4,@NOTE
-  DB56   1619           	JNE	BPFETCH
-  DB58   0204 DE0E      WAIT	LI	R4,WAITMSG
-  DB5C   2DA0 DCEE      	CALL	@OUTSTR
-  DB60   04C1           	CLR	R1
-  DB62   2DA0 0001      	CALL	@CIN
-  DB66   064A           	DECT	SP
-  DB68   C681           	MOV	R1,*SP
-  DB6A   D0E0 D018      	MOVB	@CR,R3
-  DB6E   2DA0 DCC4      	CALL	@OUTCHAR
-  DB72   C07A           	MOV	*SP+,R1
-  DB74   9801 D018      	CB	R1,@CR
-  DB78   1308           	JEQ	BPFETCH
-  DB7A   9801 D010      	CB	R1,@CTLC
-  DB7E   1325           	JEQ	UNPROC
-  DB80   9801 D012      	CB	R1,@CTLS
-  DB84   16E9           	JNE	WAIT
-  DB86   0720 DD08      	SETO	@SKIPSW
-  DB8A   0460 DA10      BPFETCH	B	@PFETCH
-  DB8E   0460 D0B8      BTDOCMD	B	@DOCMD
+  DCDA   D060 0250      PEOL	MOVB	@CMDLINE,R1
+  DCDE   9060 D01C      	CB	@COMT,R1
+  DCE2   1330           	JEQ	BPFETCH
+  DCE4   9060 D020      	CB	@NOTE,R1
+  DCE8   1303           	JEQ	VIEW
+  DCEA   C060 DEC4      	MOV	@VSW,R1
+  DCEE   1304           	JEQ	CKNSW
+  DCF0   0204 0250      VIEW	LI	R4,CMDLINE
+  DCF4   2DA0 DEA8      	CALL	@OUTSTR
+  DCF8   C060 DEC6      CKNSW	MOV	@NSW,R1
+  DCFC   1623           	JNE	BPFETCH
+  DCFE   D060 0250      	MOVB	@CMDLINE,R1
+  DD02   9060 D020      	CB	@NOTE,R1
+  DD06   1620           	JNE	BTDOCMD
+  DD08   0204 0250      	LI	R4,CMDLINE
+  DD0C   0584           	INC	R4
+  DD0E   9814 D020      	CB	*R4,@NOTE
+  DD12   1618           	JNE	BPFETCH
+  DD14   0204 DFC8      WAIT	LI	R4,WAITMSG
+  DD18   2DA0 DEA8      	CALL	@OUTSTR
+  DD1C   04C1           	CLR	R1
+  DD1E   2DA0 0001      	CALL	@CIN
+  DD22   2E01           	PUSH	R1
+                        ;	DECT	SP
+                        ;	MOV	R1,*SP
+  DD24   D0E0 D018      	MOVB	@CR,R3
+  DD28   2DA0 DE7E      	CALL	@OUTCHAR
+                        ;	MOV	*SP+,R1
+  DD2C   2E41           	POP	R1
+  DD2E   9801 D018      	CB	R1,@CR
+  DD32   1308           	JEQ	BPFETCH
+  DD34   9801 D010      	CB	R1,@CTLC
+  DD38   1325           	JEQ	UNPROC
+  DD3A   9801 D012      	CB	R1,@CTLS
+  DD3E   16EA           	JNE	WAIT
+  DD40   0720 DEC2      	SETO	@SKIPSW
+  DD44   0460 DBCC      BPFETCH	B	@PFETCH
+  DD48   0460 D0CA      BTDOCMD	B	@DOCMD
                         
                         ;*******************************************************************
                         ;	Error output
                         ;*******************************************************************
-  DB92   0204 0250      CMDERR	LI	R4,CMDLINE
-  DB96   1014           	JMP	ERROUT
-  DB98   C0A0 D018      LINERR	MOV	@CR,R2
-  DB9C   0204 DDEC      	LI	R4,LINEMSG
-  DBA0   100F           	JMP	ERROUT
-  DBA2   0204 DDD6      PARMERR	LI	R4,PARMSG
-  DBA6   100C           	JMP	ERROUT
-  DBA8   0204 DDC4      SHELLERR	LI	R4,SHELLMSG
-  DBAC   1009           	JMP	ERROUT
-  DBAE   0204 DDFC      HARDERR	LI	R4,HARDMSG
-  DBB2   1006           	JMP	ERROUT
-  DBB4   0204 DDA9      NULLERR	LI	R4,NULLMSG
-  DBB8   1003           	JMP	ERROUT
-  DBBA   0204 DDAC      NESTERR	LI	R4,NESTMSG
-  DBBE   1000           	JMP	ERROUT
+  DD4C   0204 0250      CMDERR	LI	R4,CMDLINE
+  DD50   1014           	JMP	ERROUT
+  DD52   C0A0 D018      LINERR	MOV	@CR,R2
+  DD56   0204 DFA6      	LI	R4,LINEMSG
+  DD5A   100F           	JMP	ERROUT
+  DD5C   0204 DF90      PARMERR	LI	R4,PARMSG
+  DD60   100C           	JMP	ERROUT
+  DD62   0204 DF7E      SHELLERR	LI	R4,SHELLMSG
+  DD66   1009           	JMP	ERROUT
+  DD68   0204 DFB6      HARDERR	LI	R4,HARDMSG
+  DD6C   1006           	JMP	ERROUT
+  DD6E   0204 DF63      NULLERR	LI	R4,NULLMSG
+  DD72   1003           	JMP	ERROUT
+  DD74   0204 DF66      NESTERR	LI	R4,NESTMSG
+  DD78   1000           	JMP	ERROUT
                         ERROUT:
-  DBC0   2FA0 DDAA      	MESG	@QUESTMSG
-  DBC4   2F94           	MESG	*R4
-  DBC6   2FA0 D604      	MESG	@CRLF
+  DD7A   2FA0 DF64      	MESG	@QUESTMSG
+  DD7E   2F94           	MESG	*R4
+  DD80   2FA0 D77C      	MESG	@CRLF
                         
-  DBCA   04E0 DD06      UNPROC	CLR	@PROCSW
-  DBCE   0204 D0D2      	LI	R4,CHKSYS
-  DBD2   05C4           	INCT	R4
-  DBD4   D520 D023      	MOVB	@SYSFILE,*R4
-  DBD8   0460 D4C2      	B	@RETURN
+  DD84   04E0 DEC0      UNPROC	CLR	@PROCSW
+  DD88   0204 D0E4      	LI	R4,CHKSYS
+  DD8C   05C4           	INCT	R4
+  DD8E   D520 D023      	MOVB	@SYSFILE,*R4
+  DD92   0460 D63A      	B	@RETURN
                         
-  DBDC   C060 DD06      DOPROC	MOV	@PROCSW,R1
-  DBE0   16EC           	JNE	NESTERR
-  DBE2   0701           	SETO	R1
-  DBE4   C801 DD06      	MOV	R1,@PROCSW
-  DBE8   0203 0280      	LI	R3,FCB
-  DBEC   0204 DD56      	LI	R4,MNAM
-  DBF0   0202 0010      	LI	R2,16
-  DBF4   2DA0 DCB0      	CALL	@BMOVE
-  DBF8   04C4           	CLR	R4
-  DBFA   C804 DD70      	MOV	R4,@MCNT
-  DBFE   04E0 DD0A      	CLR	@VSW
-  DC02   04E0 DD0C      	CLR	@NSW
-  DC06   0204 DEA8      	LI	R4,PPTRS
-  DC0A   C804 DEFE      	MOV	R4,@PPADDR
-  DC0E   0203 DEBE      	LI	R3,PBUF
-  DC12   0204 0250      	LI	R4,CMDLINE
-  DC16   0202 000A      	LI	R2,10
-  DC1A   04C0           	CLR	R0
-  DC1C   04C1           PARSLOOP	CLR	R1
-  DC1E   D074           	MOVB	*R4+,R1
-  DC20   0281 2D00      	CI	R1,2D00H
-  DC24   161A           	JNE	PARS1
-  DC26   C000           	MOV	R0,R0
-  DC28   1616           	JNE	PARS0B
-  DC2A   0584           	INC	R4
-  DC2C   D054           	MOVB	*R4,R1
-  DC2E   0604           	DEC	R4
-  DC30   0281 2000      	CI	R1,2000H
-  DC34   1B10           	JH	PARS0B
-  DC36   D054           	MOVB	*R4,R1
-  DC38   0281 5600      	CI	R1,5600H
-  DC3C   1604           	JNE	PARS0A
-  DC3E   C801 DD0A      	MOV	R1,@VSW
-  DC42   0584           PARS0	INC	R4
-  DC44   10EB           	JMP	PARSLOOP
-  DC46   0281 4E00      PARS0A	CI	R1,4E00H
-  DC4A   1605           	JNE	PARS0B
-  DC4C   0201 2D00      	LI	R1,2D00H
-  DC50   C801 DD0C      	MOV	R1,@NSW
-  DC54   10F6           	JMP	PARS0
-  DC56   0201 2D00      PARS0B	LI	R1,2D00H
-  DC5A   DCC1           PARS1	MOVB	R1,*R3+
-  DC5C   0281 0D00      	CI	R1,0D00H
-  DC60   1323           	JEQ	PARSEND
-  DC62   0281 2000      	CI	R1,2000H
-  DC66   1B04           	JH	PARS2
-  DC68   C000           	MOV	R0,R0
-  DC6A   13D8           	JEQ	PARSLOOP
-  DC6C   04C0           	CLR	R0
-  DC6E   10D6           	JMP	PARSLOOP
-  DC70   C000           PARS2	MOV	R0,R0
-  DC72   16D4           	JNE	PARSLOOP
-  DC74   0700           	SETO	R0
-  DC76   0602           	DEC	R2
-  DC78   1194           	JLT	PARMERR
-  DC7A   064A           	DECT	SP
-  DC7C   C684           	MOV	R4,*SP
-  DC7E   064A           	DECT	SP
-  DC80   C683           	MOV	R3,*SP
-  DC82   0603           	DEC	R3
-  DC84   D054           	MOVB	*R4,R1
-  DC86   0281 2000      	CI	R1,2000H
-  DC8A   1506           	JGT	PARS3
-  DC8C   9813 D01E      	CB	*R3,@NULPARM
-  DC90   1603           	JNE	PARS3
-  DC92   0201 2000      	LI	R1,2000H
-  DC96   D4C1           	MOVB	R1,*R3
-  DC98   C120 DEFE      PARS3	MOV	@PPADDR,R4
-  DC9C   CD03           	MOV	R3,*R4+
-  DC9E   C804 DEFE      	MOV	R4,@PPADDR
-  DCA2   C0FA           	MOV	*SP+,R3
-  DCA4   C13A           	MOV	*SP+,R4
-  DCA6   10BA           	JMP	PARSLOOP
-  DCA8   04E0 DEFE      PARSEND	CLR	@PPADDR
-  DCAC   0460 DA10      	B	@PFETCH
+  DD96   C060 DEC0      DOPROC	MOV	@PROCSW,R1
+  DD9A   16EC           	JNE	NESTERR
+  DD9C   0701           	SETO	R1
+  DD9E   C801 DEC0      	MOV	R1,@PROCSW
+  DDA2   0203 0280      	LI	R3,FCB
+  DDA6   0204 DF10      	LI	R4,MNAM
+  DDAA   0202 0010      	LI	R2,16
+  DDAE   2DA0 DE6A      	CALL	@BMOVE
+  DDB2   04C4           	CLR	R4
+  DDB4   C804 DF2A      	MOV	R4,@MCNT
+  DDB8   04E0 DEC4      	CLR	@VSW
+  DDBC   04E0 DEC6      	CLR	@NSW
+  DDC0   0204 E062      	LI	R4,PPTRS
+  DDC4   C804 E0B8      	MOV	R4,@PPADDR
+  DDC8   0203 E078      	LI	R3,PBUF
+  DDCC   0204 0250      	LI	R4,CMDLINE
+  DDD0   0202 000A      	LI	R2,10
+  DDD4   04C0           	CLR	R0
+  DDD6   04C1           PARSLOOP	CLR	R1
+  DDD8   D074           	MOVB	*R4+,R1
+  DDDA   0281 2D00      	CI	R1,2D00H
+  DDDE   161A           	JNE	PARS1
+  DDE0   C000           	MOV	R0,R0
+  DDE2   1616           	JNE	PARS0B
+  DDE4   0584           	INC	R4
+  DDE6   D054           	MOVB	*R4,R1
+  DDE8   0604           	DEC	R4
+  DDEA   0281 2000      	CI	R1,2000H
+  DDEE   1B10           	JH	PARS0B
+  DDF0   D054           	MOVB	*R4,R1
+  DDF2   0281 5600      	CI	R1,5600H
+  DDF6   1604           	JNE	PARS0A
+  DDF8   C801 DEC4      	MOV	R1,@VSW
+  DDFC   0584           PARS0	INC	R4
+  DDFE   10EB           	JMP	PARSLOOP
+  DE00   0281 4E00      PARS0A	CI	R1,4E00H
+  DE04   1605           	JNE	PARS0B
+  DE06   0201 2D00      	LI	R1,2D00H
+  DE0A   C801 DEC6      	MOV	R1,@NSW
+  DE0E   10F6           	JMP	PARS0
+  DE10   0201 2D00      PARS0B	LI	R1,2D00H
+  DE14   DCC1           PARS1	MOVB	R1,*R3+
+  DE16   0281 0D00      	CI	R1,0D00H
+  DE1A   1323           	JEQ	PARSEND
+  DE1C   0281 2000      	CI	R1,2000H
+  DE20   1B04           	JH	PARS2
+  DE22   C000           	MOV	R0,R0
+  DE24   13D8           	JEQ	PARSLOOP
+  DE26   04C0           	CLR	R0
+  DE28   10D6           	JMP	PARSLOOP
+  DE2A   C000           PARS2	MOV	R0,R0
+  DE2C   16D4           	JNE	PARSLOOP
+  DE2E   0700           	SETO	R0
+  DE30   0602           	DEC	R2
+  DE32   1194           	JLT	PARMERR
+  DE34   064A           	DECT	SP
+  DE36   C684           	MOV	R4,*SP
+  DE38   064A           	DECT	SP
+  DE3A   C683           	MOV	R3,*SP
+  DE3C   0603           	DEC	R3
+  DE3E   D054           	MOVB	*R4,R1
+  DE40   0281 2000      	CI	R1,2000H
+  DE44   1506           	JGT	PARS3
+  DE46   9813 D01E      	CB	*R3,@NULPARM
+  DE4A   1603           	JNE	PARS3
+  DE4C   0201 2000      	LI	R1,2000H
+  DE50   D4C1           	MOVB	R1,*R3
+  DE52   C120 E0B8      PARS3	MOV	@PPADDR,R4
+  DE56   CD03           	MOV	R3,*R4+
+  DE58   C804 E0B8      	MOV	R4,@PPADDR
+  DE5C   C0FA           	MOV	*SP+,R3
+  DE5E   C13A           	MOV	*SP+,R4
+  DE60   10BA           	JMP	PARSLOOP
+  DE62   04E0 E0B8      PARSEND	CLR	@PPADDR
+  DE66   0460 DBCC      	B	@PFETCH
                         
-  DCB0   DD33           BMOVE	MOVB	*R3+,*R4+
-  DCB2   0602           	DEC	R2
-  DCB4   16FD           	JNE	BMOVE
-  DCB6   2DC0           	RET
+  DE6A   DD33           BMOVE	MOVB	*R3+,*R4+
+  DE6C   0602           	DEC	R2
+  DE6E   16FD           	JNE	BMOVE
+  DE70   2DC0           	RET
                         
                         ;*******************************************************************
                         ;	Console I/O
                         ;*******************************************************************
-  DCB8   0202 0001      INCHAR	LI	R2,CIN
-  DCBC   2DA0 E400      	CALL	@BDOS
-  DCC0   06C1           	SWPB	R1
-  DCC2   2DC0           	RET
+  DE72   0202 0001      INCHAR	LI	R2,CIN
+  DE76   2DA0 E400      	CALL	@BDOS
+  DE7A   06C1           	SWPB	R1
+  DE7C   2DC0           	RET
                         
-  DCC4   064A           OUTCHAR	DECT	SP
-  DCC6   C683           	MOV	R3,*SP
-  DCC8   06C3           	SWPB	R3
-  DCCA   0202 0002      	LI	R2,COUT
-  DCCE   2DA0 E400      	CALL	@BDOS
-  DCD2   C0FA           	MOV	*SP+,R3
-  DCD4   9803 D018      	CB	R3,@CR
-  DCD8   1609           	JNE	OUT0
-  DCDA   D0E0 D019      	MOVB	@LF,R3
-  DCDE   06C3           	SWPB	R3
-  DCE0   0202 0002      	LI	R2,COUT
-  DCE4   2DA0 E400      	CALL	@BDOS
-  DCE8   0203 0D0A      	LI	R3,0D0AH
-  DCEC   2DC0           OUT0	RET
+  DE7E   064A           OUTCHAR	DECT	SP
+  DE80   C683           	MOV	R3,*SP
+  DE82   06C3           	SWPB	R3
+  DE84   0202 0002      	LI	R2,COUT
+  DE88   2DA0 E400      	CALL	@BDOS
+  DE8C   C0FA           	MOV	*SP+,R3
+  DE8E   9803 D018      	CB	R3,@CR
+  DE92   1609           	JNE	OUT0
+  DE94   D0E0 D019      	MOVB	@LF,R3
+  DE98   06C3           	SWPB	R3
+  DE9A   0202 0002      	LI	R2,COUT
+  DE9E   2DA0 E400      	CALL	@BDOS
+  DEA2   0203 0D0A      	LI	R3,0D0AH
+  DEA6   2DC0           OUT0	RET
                         
-  DCEE   D0D4           OUTSTR	MOVB	*R4,R3
-  DCF0   1304           	JEQ	STR0
-  DCF2   0584           	INC	R4
-  DCF4   2DA0 DCC4      	CALL	@OUTCHAR
-  DCF8   10FA           	JMP	OUTSTR
-  DCFA   2DC0           STR0	RET
+  DEA8   D0D4           OUTSTR	MOVB	*R4,R3
+  DEAA   1304           	JEQ	STR0
+  DEAC   0584           	INC	R4
+  DEAE   2DA0 DE7E      	CALL	@OUTCHAR
+  DEB2   10FA           	JMP	OUTSTR
+  DEB4   2DC0           STR0	RET
                         
                         ;*******************************************************************
                         ;	Variables
                         ;*******************************************************************
-  DCFC   0000           CMDADDR		WORD	0
-  DCFE   0000           CMDBYTES	WORD	0
-  DD00   0000           DOSV		WORD	0
-  DD02   0000           HDERRV		WORD	0
-  DD04   0000           DOSERRV		WORD	0
-  DD06   0000           PROCSW		WORD	0
-  DD08   0000           SKIPSW		WORD	0
-  DD0A   0000           VSW		WORD	0
-  DD0C   0000           NSW		WORD	0
-  DD0E   0000           SUBFLAG		WORD	0
-  DD10   0000           LADDR		WORD	0
+  DEB6   0000           CMDADDR		WORD	0
+  DEB8   0000           CMDBYTES	WORD	0
+  DEBA   0000           DOSV		WORD	0
+  DEBC   0000           HDERRV		WORD	0
+  DEBE   0000           DOSERRV		WORD	0
+  DEC0   0000           PROCSW		WORD	0
+  DEC2   0000           SKIPSW		WORD	0
+  DEC4   0000           VSW		WORD	0
+  DEC6   0000           NSW		WORD	0
+  DEC8   0000           SUBFLAG		WORD	0
+  DECA   0000           LADDR		WORD	0
                         
-  DD12   0000           VMENTRY		WORD	0
-  DD14   0D00           CMDLINE2	BYTE	0DH,00
-  DD16                  		EVEN
-  DD16                  		BSS	CLSZ
-  DD56                  		EVEN
+  DECC   0000           VMENTRY		WORD	0
+  DECE   0D00           CMDLINE2	BYTE	0DH,00
+  DED0                  		EVEN
+  DED0                  		BSS	CLSZ
+  DF10                  		EVEN
                         
-  DD56                  		EVEN
-  DD56                  MNAM		BSS	NAMSIZ
-  DD61   00             		EVEN
-  DD62                  		BSS	2
-  DD64                  		EVEN
-  DD64   0000           MFTY		WORD	0
-  DD66   0000           MFSZ		WORD	0
-  DD68                  		BSS	8
-  DD70   0000           MCNT		WORD	0
-  DD72   0000           MADDR		WORD	0
+  DF10                  		EVEN
+  DF10                  MNAM		BSS	NAMSIZ
+  DF1B   00             		EVEN
+  DF1C                  		BSS	2
+  DF1E                  		EVEN
+  DF1E   0000           MFTY		WORD	0
+                        ;MSAVE		WORD	0				; R0 SAVE ACROSS BDOS IN L_TRY
+  DF20   0000           MFSZ		WORD	0
+  DF22                  		BSS	8
+  DF2A   0000           MCNT		WORD	0
+  DF2C   0000           MADDR		WORD	0
                         
                         ;*******************************************************************
                         ;	Messages
                         ;*******************************************************************
-  DD74   0D0A           SINON	BYTE	0DH,0AH
-  DD76   5368 656C      	TEXT	'Shell Version 5.6'
-  DD7A   6C20 5665      
-  DD7E   7273 696F      
-  DD82   6E20 352E      
-  DD86   36             
-  DD87   0D0A           	BYTE	0DH,0AH
-  DD89   544D 5339      	TEXT	'TMS99105 SBC V4 - Paged Memory'
-  DD8D   3931 3035      
-  DD91   2053 4243      
-  DD95   2056 3420      
-  DD99   2D20 5061      
-  DD9D   6765 6420      
-  DDA1   4D65 6D6F      
-  DDA5   7279           
-  DDA7   0D0A           	BYTE	0DH,0AH
-  DDA9   00             NULLMSG	BYTE	0
-  DDAA                  	EVEN
+  DF2E   0D0A           SINON	BYTE	0DH,0AH
+  DF30   5368 656C      	TEXT	'Shell Version 5.7'
+  DF34   6C20 5665      
+  DF38   7273 696F      
+  DF3C   6E20 352E      
+  DF40   37             
+  DF41   0D0A           	BYTE	0DH,0AH
+  DF43   544D 5339      	TEXT	'TMS99105 SBC V4 - Paged Memory'
+  DF47   3931 3035      
+  DF4B   2053 4243      
+  DF4F   2056 3420      
+  DF53   2D20 5061      
+  DF57   6765 6420      
+  DF5B   4D65 6D6F      
+  DF5F   7279           
+  DF61   0D0A           	BYTE	0DH,0AH
+  DF63   00             NULLMSG	BYTE	0
+  DF64                  	EVEN
                         
-  DDAA   3F             QUESTMSG	TEXT	"?"
-  DDAB   00             		BYTE	0
-  DDAC                  		EVEN
-  DDAC   5072 6F67      NESTMSG		TEXT	"Program name expected:"
-  DDB0   7261 6D20      
-  DDB4   6E61 6D65      
-  DDB8   2065 7870      
-  DDBC   6563 7465      
-  DDC0   643A           
-  DDC2   0D00           		BYTE	0DH,00
-  DDC4                  		EVEN
-  DDC4   5368 656C      SHELLMSG	TEXT	"Shell error:"
-  DDC8   6C20 6572      
-  DDCC   726F 723A      
-  DDD0   0D00           		BYTE	0DH,00H
-  DDD2                  		EVEN
-  DDD2   0820 0800      RUBMSG		BYTE	08H,20H,08H,0
-  DDD6                  		EVEN
-  DDD6   546F 6F20      PARMSG		TEXT	"Too many parameters:"
-  DDDA   6D61 6E79      
-  DDDE   2070 6172      
-  DDE2   616D 6574      
-  DDE6   6572 733A      
-  DDEA   0D00           		BYTE	0DH,00
-  DDEC                  		EVEN
-  DDEC   4C69 6E65      LINEMSG		TEXT	"Line too long:"
-  DDF0   2074 6F6F      
-  DDF4   206C 6F6E      
-  DDF8   673A           
-  DDFA   0D00           		BYTE	0DH,00
-  DDFC                  		EVEN
-  DDFC   4861 7264      HARDMSG		TEXT	"Hard disc error"
-  DE00   2064 6973      
-  DE04   6320 6572      
-  DE08   726F 72        
-  DE0B   0D00           		BYTE	0DH,00
-  DE0D   00             		EVEN
-  DE0E   2D2D 7761      WAITMSG		TEXT	"--waiting..."
-  DE12   6974 696E      
-  DE16   672E 2E2E      
-  DE1A   00             		BYTE	0
-  DE1B   00             		EVEN
+  DF64   3F             QUESTMSG	TEXT	"?"
+  DF65   00             		BYTE	0
+  DF66                  		EVEN
+  DF66   5072 6F67      NESTMSG		TEXT	"Program name expected:"
+  DF6A   7261 6D20      
+  DF6E   6E61 6D65      
+  DF72   2065 7870      
+  DF76   6563 7465      
+  DF7A   643A           
+  DF7C   0D00           		BYTE	0DH,00
+  DF7E                  		EVEN
+  DF7E   5368 656C      SHELLMSG	TEXT	"Shell error:"
+  DF82   6C20 6572      
+  DF86   726F 723A      
+  DF8A   0D00           		BYTE	0DH,00H
+  DF8C                  		EVEN
+  DF8C   0820 0800      RUBMSG		BYTE	08H,20H,08H,0
+  DF90                  		EVEN
+  DF90   546F 6F20      PARMSG		TEXT	"Too many parameters:"
+  DF94   6D61 6E79      
+  DF98   2070 6172      
+  DF9C   616D 6574      
+  DFA0   6572 733A      
+  DFA4   0D00           		BYTE	0DH,00
+  DFA6                  		EVEN
+  DFA6   4C69 6E65      LINEMSG		TEXT	"Line too long:"
+  DFAA   2074 6F6F      
+  DFAE   206C 6F6E      
+  DFB2   673A           
+  DFB4   0D00           		BYTE	0DH,00
+  DFB6                  		EVEN
+  DFB6   4861 7264      HARDMSG		TEXT	"Hard disc error"
+  DFBA   2064 6973      
+  DFBE   6320 6572      
+  DFC2   726F 72        
+  DFC5   0D00           		BYTE	0DH,00
+  DFC7   00             		EVEN
+  DFC8   2D2D 7761      WAITMSG		TEXT	"--waiting..."
+  DFCC   6974 696E      
+  DFD0   672E 2E2E      
+  DFD4   00             		BYTE	0
+  DFD5   00             		EVEN
                         
                         ;*******************************************************************
                         ;	INT_SAFE - Safe interrupt handler for uninitialized vectors
-  DE1C   0380           INT_SAFE:	RTWP
+  DFD6   0380           INT_SAFE:	RTWP
                         
                         ;	INT2_HANDLER - Paged execution crash debug
                         ;
@@ -1750,63 +2111,63 @@
                         ;	all 16 map registers, then returns to monitor.
                         ;*******************************************************************
                         INT2_HANDLER:
-  DE1E   2FA0 DE62      	MESG	@TXT_INT2PC
-  DE22   2E8E           	WHEX	R14			;PC AT EXCEPTION
-  DE24   2FA0 DE6C      	MESG	@TXT_INT2WP
-  DE28   2E8D           	WHEX	R13			;WORKSPACE POINTER
-  DE2A   2FA0 DE72      	MESG	@TXT_INT2ST
-  DE2E   2E8F           	WHEX	R15			;STATUS REGISTER
-  DE30   2FA0 DE7E      	MESG	@TXT_INT2NL
-  DE34   04C9           	CLR	R9
-  DE36   2C89           	PSEL	R9			;DISABLE PSEL BEFORE READING MAP REGISTERS
-  DE38   2FA0 DE78      	MESG	@TXT_INT2MAP
-  DE3C   020C 80C0      	LI	R12,MAP_WIN_BASE
-  DE40   04C8           	CLR	R8
+  DFD8   2FA0 E01C      	MESG	@TXT_INT2PC
+  DFDC   2E8E           	WHEX	R14			;PC AT EXCEPTION
+  DFDE   2FA0 E026      	MESG	@TXT_INT2WP
+  DFE2   2E8D           	WHEX	R13			;WORKSPACE POINTER
+  DFE4   2FA0 E02C      	MESG	@TXT_INT2ST
+  DFE8   2E8F           	WHEX	R15			;STATUS REGISTER
+  DFEA   2FA0 E038      	MESG	@TXT_INT2NL
+  DFEE   04C9           	CLR	R9
+  DFF0   2C89           	PSEL	R9			;DISABLE PSEL BEFORE READING MAP REGISTERS
+  DFF2   2FA0 E032      	MESG	@TXT_INT2MAP
+  DFF6   020C 80C0      	LI	R12,MAP_WIN_BASE
+  DFFA   04C8           	CLR	R8
                         INT2_ML:
-  DE42   04C1           	CLR	R1
-  DE44   3481           	STCR	R1,BYTEWIDE
-  DE46   09E1           	SRL	R1,14
-  DE48   2E81           	WHEX	R1
-  DE4A   0200 2000      	LI	R0,2000H
-  DE4E   2F00           	WRITE	R0
-  DE50   05CC           	INCT	R12
-  DE52   0588           	INC	R8
-  DE54   0288 0010      	CI	R8,16
-  DE58   1AF4           	JL	INT2_ML
-  DE5A   2FA0 DE7E      	MESG	@TXT_INT2NL
-  DE5E   0460 F004      	B	@0F004H
+  DFFC   04C1           	CLR	R1
+  DFFE   3481           	STCR	R1,BYTEWIDE
+  E000   09E1           	SRL	R1,14
+  E002   2E81           	WHEX	R1
+  E004   0200 2000      	LI	R0,2000H
+  E008   2F00           	WRITE	R0
+  E00A   05CC           	INCT	R12
+  E00C   0588           	INC	R8
+  E00E   0288 0010      	CI	R8,16
+  E012   1AF4           	JL	INT2_ML
+  E014   2FA0 E038      	MESG	@TXT_INT2NL
+  E018   0460 F004      	B	@0F004H
                         
-  DE62   494E 5432      TXT_INT2PC:	TEXT	'INT2 PC:'
-  DE66   2050 433A      
-  DE6A   00             		BYTE	0
-  DE6B   00             		EVEN
-  DE6C   2057 503A      TXT_INT2WP:	TEXT	' WP:'
-  DE70   00             		BYTE	0
-  DE71   00             		EVEN
-  DE72   2053 543A      TXT_INT2ST:	TEXT	' ST:'
-  DE76   00             		BYTE	0
-  DE77   00             		EVEN
-  DE78   4D41 503A      TXT_INT2MAP:	TEXT	'MAP:'
-  DE7C   00             		BYTE	0
-  DE7D   00             		EVEN
-  DE7E   0D0A 00        TXT_INT2NL:	BYTE	0DH,0AH,0
-  DE81   00             		EVEN
+  E01C   494E 5432      TXT_INT2PC:	TEXT	'INT2 PC:'
+  E020   2050 433A      
+  E024   00             		BYTE	0
+  E025   00             		EVEN
+  E026   2057 503A      TXT_INT2WP:	TEXT	' WP:'
+  E02A   00             		BYTE	0
+  E02B   00             		EVEN
+  E02C   2053 543A      TXT_INT2ST:	TEXT	' ST:'
+  E030   00             		BYTE	0
+  E031   00             		EVEN
+  E032   4D41 503A      TXT_INT2MAP:	TEXT	'MAP:'
+  E036   00             		BYTE	0
+  E037   00             		EVEN
+  E038   0D0A 00        TXT_INT2NL:	BYTE	0DH,0AH,0
+  E03B   00             		EVEN
                         
                         ;*******************************************************************
                         ;	MAP_INIT - clear all 16 map registers to page 0
                         ;	Entry: none  Exit: R0=0, R1=0, R12=MAP_WIN_BASE+32
                         ;	Called at shell cold start and LOADERCODE entry.
                         ;*******************************************************************
-  DE82   04CF           MAP_INIT:	CLR	R15
-  DE84   008F           	LST	R15
-  DE86   020C 80C0      	LI	R12,MAP_WIN_BASE
-  DE8A   04C0           	CLR	R0
-  DE8C   0201 0010      	LI	R1,NUM_MAP_ENTRIES
-  DE90   3080           MAPI_L:	LDCR	R0,BYTEWIDE
-  DE92   05CC           	INCT	R12
-  DE94   0601           	DEC	R1
-  DE96   16FC           	JNE	MAPI_L
-  DE98   045B           	RT
+  E03C   04CF           MAP_INIT:	CLR	R15
+  E03E   008F           	LST	R15
+  E040   020C 80C0      	LI	R12,MAP_WIN_BASE
+  E044   04C0           	CLR	R0
+  E046   0201 0010      	LI	R1,NUM_MAP_ENTRIES
+  E04A   3080           MAPI_L:	LDCR	R0,BYTEWIDE
+  E04C   05CC           	INCT	R12
+  E04E   0601           	DEC	R1
+  E050   16FC           	JNE	MAPI_L
+  E052   045B           	RT
                         
                         ;*******************************************************************
                         ;	MAP_SET - program one 6116 map register
@@ -1815,117 +2176,125 @@
                         ;	Note:  R8 is safe - use R8 to preserve values across MAP_SET
                         ;*******************************************************************
                         MAP_SET:
-  DE9A   020C 80C0      	LI	R12,MAP_WIN_BASE
-  DE9E   0A19           	SLA	R9,1			;SEGMENT * 2 = CRU BIT OFFSET
-  DEA0   A309           	A	R9,R12
-  DEA2   0A80           	SLA	R0,8			;MOVE PAGE TO HIGH BYTE (LDCR BYTE TRANSFER USES HIGH BYTE)
-  DEA4   3080           	LDCR	R0,BYTEWIDE
-  DEA6   045B           	RT
+  E054   020C 80C0      	LI	R12,MAP_WIN_BASE
+  E058   0A19           	SLA	R9,1			;SEGMENT * 2 = CRU BIT OFFSET
+  E05A   A309           	A	R9,R12
+  E05C   0A80           	SLA	R0,8			;MOVE PAGE TO HIGH BYTE (LDCR BYTE TRANSFER USES HIGH BYTE)
+  E05E   3080           	LDCR	R0,BYTEWIDE
+  E060   045B           	RT
                         
-  DEA8                  PPTRS	BSS	22
-  DEBE                  PBUF	BSS	64
-  DEFE   0000           PPADDR	WORD	0
+  E062                  PPTRS	BSS	22
+  E078                  PBUF	BSS	64
+  E0B8   0000           PPADDR	WORD	0
                         
-  DF00                  	END
+  E0BA                  	END
 
 No error(s).
-LDRRAWS          D44E  EXTSIZ           0003  MAP_WIN_BASE     80C0  FSB              000C  
-NOFILE           D6A8  R12              000C  EXE              0002  OUTSTR           DCEE  
-R14              000E  FINDDOT          D1D6  HARDMSG          DDFC  PADRETS          D188  
-CCOUNT           D612  MFTY             DD64  LINEMSG          DDEC  GETEXT           D1FA  
-PUSH             2E00  LDRRUN           D408  LDRDET2          D360  SINON            DD74  
-EXEC             0002  PLOOP            DA24  CMDLINE          0250  CHKCHAR          D18A  
-DEFDRV           0000  PNAME            D65A  SEG_SIZE         1000  TXT_INT2MAP      DE78  
-ERA0             D7CA  MONITOR          F000  LOAD2            D230  SUBFLAG          DD0E  
-PROC             0005  LOAD0            D29A  CMDLINE2         DD14  BMOVE            DCB0  
-PROM             D021  WRDATA           D76A  NAM3             D73A  LOAD_ONLY        D5BC  
-DSKSAVE          D6B6  MEMLIMIT         00B0  FCB_PTR          00AC  PNAME1           D66C  
-OVL_PRINT_VEC    02A0  PNAME2           D672  DSKDIR           D614  IDE_BYTSEC       0100  
-SADDR            D5BE  INT2_VEC         000A  NEXTEXT          D202  PNAME3           D69C  
-PROT_SEG         000C  EXT              D01F  CMDLOOP          D04E  LDRPM            D364  
-VIEW             DB34  NULPARM          D01E  SKLG1            D796  OUTCHAR          DCC4  
-BTDOCMD          DB8E  LT4              D292  DCOMR            0001  DLDONE           D922  
-JUMP             D01D  PARS0            DC42  DOSV             DD00  SKMK2            D808  
-BDOS_VIRT        E000  LDRPM1           D368  READ             2F40  PROMPT           D4F8  
-PARMSUB          DAD0  SKIPSW           DD08  EXT_END          D1F8  BAS              0004  
-BUFMOV2          DA9C  BPFETCH          DB8A  TXT              0003  LDRRAWS_ERR      D47C  
-FCLOSE           0010  TPA              0500  WRITERR          D80E  BLKSIZ           0200  
-DLSENT           D8C4  STAGING          0500  DLTXT_OK         D936  BUFPNT           D5B8  
-SHELLMSG         DDC4  TXT_INT2NL       DE7E  R0               0000  PARS0A           DC46  
-R2               0002  BDOS_PAGE        000E  R4               0004  PARS0B           DC56  
-R6               0006  PARMERR          DBA2  R8               0008  PARSE1           D1C4  
-MAKFIL           0016  LOADER           0300  CALL             2D80  NUM_MAP_ENTRIES  0010  
-CRLF             D604  CR               D018  START02          D6D2  CBN              0018  
-INT2_ML          DE42  TXT_LOADED       D4B8  R15              000F  BUFMOV4          DAC8  
-CTLY             D013  CHRM             D1F6  INVALID          D1AC  CIN              0001  
-POP              2E40  QUESTMSG         DDAA  BDOS_XOP_E       0120  STOWIT           D52A  
-EXT_TAB          D1EC  PARSERR          D6B2  INIT22           D074  CHRS             D1F7  
-LDRPROT          D38E  CHRT             D1F5  MAP_SET          DE9A  MADDR            DD72  
-LOAD3            D296  PSEL             2C80  SELDSK           000E  PARSLOOP         DC1C  
-BUFPUT           DAAE  CRN              001A  FILLEXT          D216  LDRRUN_F         D480  
-ATOD03           D96E  NAMSRCH          D72A  MAP_INIT         DE82  RUBMSG           DDD2  
-PROCSW           DD06  LARGERR          D82C  ATOD04           D972  RET              2DC0  
-PARS3            DC98  CHKSYS           D0D2  LDRCL            D31C  NOTHEX           D9B4  
-LDRCPY           D3BE  NOSUB            DB14  PADSPACE         D17C  INIT_LOADER      D300  
-SKMK1            D75A  BUFFSIZ          0200  PUSHREG          2D00  LBA              00A8  
-PAD              0000  MAPI_L           DE90  VSW              DD0A  NESTMSG          DDAC  
-VALID            D1A8  XOP0_PC          0042  DOLOAD           D842  BDOS             E400  
-DEBUG            2FC0  ERRMSG2          D9C8  DEL              D01A  LDRSEC           D3C8  
-HALT             10FF  WORKSP           0230  SEG_SWITCH       D1B4  CATOH            D980  
-WRSEQ            0015  LDRSEG           D37C  LADDR            DD10  SSWERR           D1B6  
-WP               000D  ICMD0            D5CE  DLSK2            D84E  HDERR            0000  
-WAITMSG          DE0E  DOPROC           DBDC  SYSFILE          D023  LDRDET           D348  
-SUBLOOP          DAF0  BUFMOVE          DA76  COMT             D01C  HARDERR          DBAE  
-STR0             DCFA  RECCNT           D5BA  PARSENAME        D1BA  LOADERCODE       D312  
-SP               000A  BDOS_SEG         000E  GOLOOP           D2E2  FLATBASE         1000  
-CINLOOP          D508  ECHO             D558  MNAM             DD56  LOAD             D21C  
-LDRRAWS1         D472  ICMDE            D5FE  EXIT             D7AC  NULLERR          DBB4  
-PARMSG           DDD6  RETURN           D4C2  FTY              000B  START00          D6CA  
-NULLMSG          DDA9  NUM_SEGS         0010  NAM              0000  R13              000D  
-ERA4             D7E4  SETDMA           001A  BDOS_XWP         0100  STACKP           1000  
-NAM5             D746  DLERR            D92E  PARS2            DC70  HDERRV           DD02  
-DOSERRV          DD04  EXTOFF           0008  LOOK             D114  NOTE             D020  
-LOOP             D982  BYTEWIDE         0002  ERA01            D7D2  SKWR1            D78C  
-SEARCH2          0012  SWITCH           D5C0  DOSERR           0000  LDRRAW           D432  
-WRITE            2F00  NEXTCMD          D4EE  RUBOUT           D56A  LOADRUN          D26E  
-BUFF_PTR         00A4  DDEN             0001  ICMD2            D5F2  DLTXT_ERR        D940  
-PADLOOP          D180  LDRDET1          D352  R1               0001  TXT_INT2WP       DE6C  
-R5               0005  UNPROC           DBCA  R9               0009  ERAFILE          D7B6  
-CTLC             D010  DIREXIT          D69E  END_LOADER       D4C2  LF               D019  
-CTLX             D011  FILLNAME         D1D2  VMENTRY          DD12  RELB             001C  
-FLA              0010  PSEL_EN          0100  LDRRUN_LOAD      D420  LOAD1            D2BC  
-MESG             2F80  BYTSEC           0200  PARSEND          DCA8  RELR             001E  
-ATOD00           D95A  CMDPTR           00A0  GODOCMD          D584  XOP0_WP          0040  
-CMDERR           DB92  LDRERR           D49A  WHEX             2E80  CLOSERR          D81E  
-BANNER           F004  TXT_INT2ST       DE72  PPADDR           DEFE  LDRRAW1          D43E  
-LDRBLK           D3A4  PARS1            DC5A  NULLPARM         DB18  TXT_LDRERR       D4A2  
-NESTERR          DBBA  LOAD1B           D2D0  DLPM             D8A6  LOAD1C           D2DA  
-ERRMSG5          D9F7  BDOS_CRU         80DC  INCHAR           DCB8  FREEMEM          00A6  
-ATOD             D954  DOCMD2A          D0F2  PPTRS            DEA8  LOADF1           D266  
-SUBLOOP2         DAF8  LOADF3           D240  SHELL_PTR        0080  LDRDET_ERR       D34E  
-OUT0             DCEC  LOADF0           D244  INIT_IV          D03E  DOCMDAA          D0E6  
-MOVERR           DACC  PREPARSE         D6F4  PEOL             DB1E  CONSOLE          0000  
-NAM2             D706  LINERR           DB98  PFETCH           DA10  SETFLAG          D1B0  
-TXT_INT2PC       DE62  CKNSW            DB3C  RHEX             2EC0  ICMD             D5C2  
-DSKDIR1          D644  INT2_HANDLER     DE1E  CMDL_SIZE        00A2  ERROUT           DBC0  
-POPREG           2D40  CMDBYTES         DCFE  R3               0003  SEARCH1          0011  
-RDSEQ            0014  ICLIST           D596  CTLS             D012  SHELL            D000  
-FSZ              000E  CLSZ             0040  R11              000B  IL0              D308  
-MFSZ             DD66  FOPEN            000F  L_FOUND          D158  SUBMARK          D022  
-LT3              D288  DSKDIR0          D62A  BAR              D600  MKERR            D814  
-BS               D017  CMDADDR          DCFC  COM              0001  ERAFIL           0013  
-NSW              DD0C  DOCMD            D0B8  PBUF             DEBE  PARSMSG          D824  
-FCB              0280  MKERR2           D832  PRO              0005  CMDL_PTR         00A0  
-MNOFILE          D607  DOSCMD           D024  MCNT             DD70  ERRMSG3          D9D8  
-GOTONE           D9A6  DOCMD1           D0DC  ERRMSG4          D9E7  DOCMD2           D0EC  
-R7               0007  DOCMD3           D10A  CTLZ             D014  INIT             D026  
-WAIT             DB58  PROCERR1         DA72  BDOS_PTR         0084  CIOERR           D592  
-COUT             0002  DOCMD4           D0F6  GOPROG           D2DE  ICMD1            D5EE  
-L_START          D138  DOCMD9           D110  R10              000A  WRDATAC          D7A0  
-LT2              D27E  ERAPERR          D7B2  DLSK1            D846  PROCERR0         DA6E  
-SPACE            D015  DLCPY            D8DA  CMDCNT           0005  NAMSIZ           000B  
-ERRMSG1          D9B8  SHELLERR         DBA8  ERAE             D808  L_TRY            D12C  
-EOF              D01B  STOWIT2          D544  LDRSENT          D398  COMM_BUF         0300  
-COMM_FCB         0280  TYPEFILE         D950  INT_SAFE         DE1C  LOOKERR          D154  
-BUFMOV3          DAA8  
+LDRRAWS          D58E  FCB              0280  MAP_WIN_BASE     80C0  LDRBLK_E         D3E8  
+LOADERCODE_EXE   D382  EXTSIZ           0003  OUT0             DEA6  FSB              000C  
+LDRRAWS1         D5B2  INIT_LOADER_EXE  D370  COMM_FCB         0280  R12              000C  
+EXIT             D924  OUTSTR           DEA8  INIT_IV          D03E  FINDDOT          D1DE  
+LINEMSG          DFA6  PADRETS          D190  OVL_CURR_ID      02A8  MFTY             DF1E  
+PRO              0005  GETEXT           D202  MOVERR           DC88  LDRRUN           D60A  
+NULLMSG          DF63  SINON            DF2E  OVLMGR_CODE_END  D53C  PLOOP            DBE0  
+SEG_SIZE         1000  CHKCHAR          D192  ERA0             D942  PNAME            D7D2  
+LOAD2            D26C  TXT_INT2MAP      E032  MNOFILE          D77F  MONITOR          F000  
+BDOS_XWP         0100  SUBFLAG          DEC8  NAM2             D87E  LOAD0            D2D6  
+PROM             D021  BMOVE            DE6A  DSKSAVE          D82E  WRDATA           D8E2  
+FCB_PTR          00AC  OVL_INIT_VEC     02A2  OVL_PRINT_VEC    02A0  MEMLIMIT         00B0  
+DSKDIR           D78C  LOAD_ONLY        D734  DOSERRV          DEBE  PNAME1           D7E4  
+MCNT             DF2A  PNAME2           D7EA  LOOK             D126  IDE_BYTSEC       0100  
+TXT_INT2PC       E01C  INT2_VEC         000A  LOOP             DB3E  PNAME3           D814  
+OVLMGR_BASE      0A00  OVLMGR_CR        D53A  SKLG1            D90E  EXT              D01F  
+BTDOCMD          DD48  SFTY_LOOP        D22A  RHEX             2EC0  NULPARM          D01E  
+SFTY_FOUND       D250  OUTCHAR          DE7E  JUMP             D01D  LT4              D2CE  
+DOSV             DEBA  DLDONE           DAD4  BDOS_VIRT        E000  PARS0            DDFC  
+READ             2F40  SKMK2            D980  PARMSUB          DC8C  SKIPSW           DEC2  
+EXT_END          D200  PROMPT           D670  BUFMOV2          DC58  BAS              0004  
+TXT              0003  GOLOOP_E         D352  FCLOSE           0010  OVLMGR_C         D508  
+WRITERR          D986  LDRRAWS_ERR      D5BC  DLTXT_OK         DAE4  BPFETCH          DD44  
+SHELLMSG         DF7E  TPA              0500  STAGING_END      0700  BLKSIZ           0200  
+R0               0000  STAGING          0500  R2               0002  BUFPNT           D730  
+R4               0004  TXT_INT2NL       E038  R6               0006  PARS0A           DE00  
+R8               0008  BDOS_PAGE        000E  MAKFIL           0016  PARS0B           DE10  
+CALL             2D80  PARMERR          DD5C  CRLF             D77C  PARSE1           D1CC  
+START02          D84A  LOADER           0300  DLCPY_S          DA38  NUM_MAP_ENTRIES  0010  
+CTLS             D012  CR               D018  R15              000F  CBN              0018  
+CTLY             D013  TXT_LOADED       D600  INVALID          D1B4  BUFMOV4          DC84  
+POP              2E40  EXE_STG          0500  FSZ              000E  PARSERR          D82A  
+DLSK_G           DA1A  CIN              0001  LDREDET_OK       D3C2  QUESTMSG         DF64  
+SFTY_NONE        D24E  STOWIT           D6A2  EXT_TAB          D1F4  PARSLOOP         DDD6  
+INIT22           D086  MADDR            DF2C  R11              000B  PSEL             2C80  
+MESG             2F80  CRN              001A  WAIT             DD14  LDRRUN_F         D5C0  
+PARSEND          DE62  EXE_STG2         0700  OVL_CURR_SEG     02AA  NAMSRCH          D8A2  
+MFSZ             DF20  RUBMSG           DF8C  ATOD03           DB2A  LARGERR          D9A4  
+MAP_INIT         E03C  RET              2DC0  PROCSW           DEC0  CHKSYS           D0E4  
+ATOD04           DB2E  NOTHEX           DB70  PARS3            DE52  NOSUB            DCD0  
+WHEX             2E80  INIT_LOADER      D33C  PADSPACE         D184  BUFFSIZ          0200  
+SKMK1            D8D2  LBA              00A8  PUSHREG          2D00  MAPI_L           E04A  
+DLBLK            DA22  NESTMSG          DF66  COPY_OVL1        D4D6  XOP0_PC          0042  
+VSW              DEC4  BDOS             E400  COUT             0002  SYS              0000  
+DOLOAD           D9BA  ERRMSG2          DB84  DEBUG            2FC0  WORKSP           0230  
+DEL              D01A  CATOH            DB3C  HALT             10FF  SSWERR           D1BE  
+SEG_SWITCH       D1BC  ICMD0            D746  WRSEQ            0015  HDERR            0000  
+ERRMSG5          DBB3  DOPROC           DD96  WP               000D  DLDONE_B         DA94  
+LDRCPYW_E        D420  LDRDET           D568  INCHAR           DE72  BUFMOVE          DC32  
+OVLMGR_CODE      D4EE  HARDERR          DD68  NSW              DEC6  RECCNT           D732  
+SUBLOOP          DCAC  LOADERCODE       D53C  LDRCPY_E         D418  BDOS_SEG         000E  
+PPTRS            E062  FLATBASE         1000  PBUF             E078  OVL_COUNT        02A6  
+SUBLOOP2         DCB4  ECHO             D6D0  L_START          D14A  LOAD             D258  
+SHELL_PTR        0080  LDRRUN_F1        D5CA  CINLOOP          D680  ICMDE            D776  
+NOFILE           D820  NULLERR          DD6E  R14              000E  RETURN           D63A  
+GOPROG_EXE       D34E  START00          D842  PARMSG           DF90  NUM_SEGS         0010  
+FTY              000B  R13              000D  DEFDRV           0000  SETDMA           001A  
+NAM              0000  STACKP           1000  ERA4             D95C  DLERR            DADC  
+OVL_SWAP_VEC     02A4  HDERRV           DEBC  NAM5             D8BE  EXTOFF           0008  
+PARS2            DE2A  NOTE             D020  OVL_SEG_TAB      02CC  BYTEWIDE         0002  
+NEXTEXT          D20A  SKWR1            D904  CMDLOOP          D060  SWITCH           D738  
+LT2              D2BA  LDRRAW           D572  LDRSEC_EOK       D46E  NEXTCMD          D666  
+SEARCH2          0012  LOADRUN          D2AA  DOSERR           0000  DDEN             0001  
+WRITE            2F00  DLTXT_ERR        DAFC  RUBOUT           D6E2  SET_FTY          D224  
+BUFF_PTR         00A4  TXT_INT2WP       E026  ICMD2            D76A  COPY_OVLMGR      D4C8  
+PADLOOP          D188  OVL_PAGE_TAB     02AC  R1               0001  UNPROC           DD84  
+R5               0005  ERAFILE          D92E  R9               0009  DIREXIT          D816  
+CTLC             D010  LF               D019  END_LOADER       D60A  FILLNAME         D1DA  
+EXE_STG_END      0900  RELB             001C  CTLZ             D014  PSEL_EN          0100  
+LDRCL_E          D38C  LOAD1            D2F8  BDOS_XOP_E       0120  BYTSEC           0200  
+DLSK_E           D9D0  RELR             001E  LDRRUN_LOAD      D628  CMDPTR           00A0  
+LOAD3            D2D2  XOP0_WP          0040  BUFPUT           DC6A  LDRERR           D5E2  
+ATOD00           DB16  LDREDET_E        D3B8  GODOCMD          D6FC  LDRSEC_E         D42A  
+CMDERR           DD4C  TXT_INT2ST       E02C  LT3              D2C4  CLOSERR          D996  
+CMDCNT           0005  LDRRAW1          D57E  PAD              0000  PARS1            DE14  
+VALID            D1B0  TXT_LDRERR       D5EA  NULLPARM         DCD4  LOAD1B           D30C  
+NESTERR          DD74  LOAD1C           D316  LADDR            DECA  BDOS_CRU         80DC  
+OVLMGR_CI        D4F6  FREEMEM          00A6  DLSK2            D9C6  DOCMD2A          D104  
+SYSFILE          D023  LOADF1           D2A2  ERRMSG1          DB74  LOADF3           D27C  
+STR0             DEB4  LDRDET_ERR       D56E  SP               000A  LOADF0           D280  
+END_LOADER_EXE   D4C8  DOCMDAA          D0F8  EXE              0002  PREPARSE         D86C  
+CCOUNT           D78A  CONSOLE          0000  CMDLINE          0250  LINERR           DD52  
+PEOL             DCDA  SETFLAG          D1B8  NAM3             D8B2  LDRMAP_E         D3F8  
+PFETCH           DBCC  LDRDONE_E        D47E  PROT_SEG         000C  CKNSW            DCF8  
+ERA01            D94A  ICMD             D73A  GOTONE           DB62  INT2_HANDLER     DFD8  
+SFTY_NEXT        D248  ERROUT           DD7A  ERRMSG4          DBA3  DLTXT_CRLF       DAF8  
+DLSK1            D9BE  CMDBYTES         DEB8  R7               0007  SEARCH1          0011  
+EOF              D01B  ICLIST           D70E  CTLX             D011  SHELL            D000  
+DLSK_F           D9F8  CLSZ             0040  SPACE            D015  IL0              D344  
+SELDSK           000E  FOPEN            000F  COMM_BUF         0300  SUBMARK          D022  
+BDOS_PTR         0084  DSKDIR0          D7A2  PPADDR           E0B8  MKERR            D98C  
+LDRCHAIN_E       D48A  CMDADDR          DEB6  BUFMOV3          DC64  ERAFIL           0013  
+GOPROG           D31A  DOCMD            D0CA  ATOD             DB10  PARSMSG          D99C  
+PARSENAME        D1C2  MKERR2           D9AA  MNAM             DF10  CMDL_PTR         00A0  
+PUSH             2E00  LDRERR_B         D3BE  CMDLINE2         DECE  DOSCMD           D024  
+SADDR            D736  ERRMSG3          DB94  DCOMR            0001  DOCMD1           D0EE  
+CMDL_SIZE        00A2  DOCMD2           D0FE  R3               0003  DOCMD3           D11C  
+INT2_ML          DFFC  INIT             D026  FLA              0010  PROCERR1         DC2E  
+FILLEXT          D21E  CIOERR           D70A  BANNER           F004  DOCMD4           D108  
+BS               D017  ICMD1            D766  WAITMSG          DFC8  DOCMD9           D122  
+GOLOOP           D31E  ILE0             D378  R10              000A  ERAPERR          D92A  
+VIEW             DCF0  PROCERR0         DC2A  POPREG           2D40  WRDATAC          D918  
+VMENTRY          DECC  DLCPY            DA40  L_FOUND          D166  NAMSIZ           000B  
+COM              0001  SHELLERR         DD62  HARDMSG          DFB6  L_TRY            D13E  
+DSKDIR1          D7BC  STOWIT2          D6BC  COMT             D01C  ERAE             D980  
+RDSEQ            0014  BAR              D778  TYPEFILE         DB0C  INT_SAFE         DFD6  
+LOOKERR          D162  MAP_SET          E054  
 

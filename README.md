@@ -1,12 +1,9 @@
-# Small-Shell-for-the-TMS9900
-
+# SHELL V6.3 — TMS99105 SBC
 ![Platform](https://img.shields.io/badge/CPU-TMS9900-blue)
 ![OS](https://img.shields.io/badge/OS-CP/M--Like-green)
 ![Language](https://img.shields.io/badge/Language-Assembly-orange)
 ![Status](https://img.shields.io/badge/Status-Retro--Project-lightgrey)
-
 ---
-# SHELL V6.3 — TMS99105 SBC
 
 Command interpreter for the TMS99105 SBC V4 (paged memory), sitting between
 the BDOS 5.9 filesystem and the user. Assembled with A99, loaded at `>C000`

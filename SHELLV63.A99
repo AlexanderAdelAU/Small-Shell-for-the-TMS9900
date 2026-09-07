@@ -464,9 +464,14 @@ L_START:	LI	R3,FCB
 	LI	R2,SEARCH1
 	CALL	@BDOS
 	MOV	R1,R1
-	JHE	L_FOUND
+;	SEARCH1 returns -1 when there is no match.  JHE is UNSIGNED, so it
+;	treated >FFFF as success - harmless while the extension was '???'
+;	and the first search always matched, fatal once the walk has to
+;	try a second entry.
+	JLT	L_RETRY
+	JMP	L_FOUND
 
-	MOV	@EXTWALK,R0	; WAS THIS A WILDCARD WALK?
+L_RETRY	MOV	@EXTWALK,R0	; WAS THIS A WILDCARD WALK?
 	JEQ	LOOKERR		; NO - EXPLICIT EXTENSION FAILED
 	AI	R0,3		; NEXT TABLE ENTRY
 	MOV	R0,@EXTWALK

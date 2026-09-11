@@ -78,9 +78,11 @@ To prevent duplicating system utilities (like `XMODEM` or `FILEEDIT`) into every
 the Shell utilizes a "BDOS" fallback architecture. If an external command is typed 
 and cannot be found in the current subfolder, the Shell safely overrides the search target 
 to `00` (Root) via FCB offset 18. This allows utilities residing in the Root directory to 
-be executed globally from within any subfolder without altering the user's working directory state.
+be executed globally from within any subfolder without altering the user's working directory state.  This feature is demonstrated in the screenshot below.
 
 ---
+
+<img src="Directories.png" alt="Folders and Directories Diagram" width="500"/>
 
 ## Command lookup
 

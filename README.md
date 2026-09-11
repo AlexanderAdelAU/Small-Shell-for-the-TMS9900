@@ -73,9 +73,9 @@ This is achieved via a 256-slot Folder Alias Table located at Block 7 on the dis
 - **Context-Aware Listings:** The `DIR` command automatically filters its output 
   based on the current active folder.
 
-### "Clever BDOS" Root Fallback
-To prevent duplicating system utilities (like `XMODEM` or `BDTEST`) into every folder, 
-the Shell utilizes a "Clever BDOS" fallback architecture. If an external command is typed 
+### "BDOS" Root Fallback
+To prevent duplicating system utilities (like `XMODEM` or `FILEEDIT`) into every folder, 
+the Shell utilizes a "BDOS" fallback architecture. If an external command is typed 
 and cannot be found in the current subfolder, the Shell safely overrides the search target 
 to `00` (Root) via FCB offset 18. This allows utilities residing in the Root directory to 
 be executed globally from within any subfolder without altering the user's working directory state.

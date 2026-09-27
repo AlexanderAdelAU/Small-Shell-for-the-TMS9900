@@ -27,7 +27,7 @@ program that lives in its own physical memory page.
 - Interprets procedure files — batch scripts with parameters, comments,
   echo control and single-step, completely decoupled from the application FCB.
 - Protects the system files: `ERA`, `SAVE` and `REN` never erase, overwrite
-  or rename a `.SYS` or `.SHC` file.
+  or rename a `.SYS` or `.SHC` file, and `COPY` never copies over one.
 
 ---
 
@@ -46,16 +46,16 @@ program that lives in its own physical memory page.
 | `>0230` | `SH_WP` | shell workspace, R0–R15 |
 | `>0250` | `SH_CMD` | command line, raw input string |
 | `>0280` | `CM_FCB` | standard FCB, 36 bytes |
-| `>02A0` | `CM_VARS` | overlay manager variables |
+| `>02A0` | `CM_VARS` | overlay manager variables; `>02A4`–`>02DF` is also `COPY`'s scratch (destination FCB and the two folder names) |
 | `>02E8` | `LGATE` | launch gate: `PSEL_EN` / `B *R8` |
 | `>02F0` | `RGATE` | return gate: `PSEL_DIS` / `B @RETURN` |
 | `>02F6` | `BGATE` | BDOS gate: `PSEL_DIS` / `CALL @BDOS` / `PSEL_EN` / `RET` |
 | `>0300` | `CM_BUF` | 512-byte sector buffer / LOADERCODE area |
 | `>0500` | `TPA` / `STAGING` | default COM load address / sector staging buffer |
 | `>0FFE` | `STACKP` | stack, grows down |
-| `>C000` | `SHELL` | the shell core (`>C000`–`>D911`) |
+| `>C000` | `SHELL` | the shell core (`>C000`–`>D358`) |
 | `>D000` | — | command window: the running internal command's page |
-| `>D5C4` | `PROC_FCB` | dedicated FCB for procedure files (in the shell's own page) |
+| `>D020` | `PROC_FCB` | dedicated FCB for procedure files (in the shell's own page) |
 | `>E000` | `BDOS` | BDOS entry |
 
 Paging (Rev 24Q hardware):
@@ -81,6 +81,7 @@ restored on return.
 | `TYPE <file>` | list a text file, pausing every 22 lines (space = next page, Enter = run on, Esc/^C = stop) |
 | `ERA <file>` | erase files — wildcards allowed: `ERA *.A99`, `ERA TEST.*`, `ERA T*.A99`, `ERA ?1.*` |
 | `REN <old> <new>` | rename a file (exact names only) |
+| `COPY <src> <dst>` | copy one file; either name may carry a `[FOLDER]` prefix (exact names only) |
 | `SAVE <sectors> <file> [-HHHH]` | write memory to a file, from `>0500` or from address `HHHH` |
 | `LOAD <file>` | load an EXE into its pages without running it |
 | `MKDIR <name>` | create a folder |
@@ -88,6 +89,28 @@ restored on return.
 | `RMDIR <name>` | remove an empty folder |
 
 A leading `.` on any command line loads without running.
+
+### DIR
+
+    DIR
+
+- Lists every file in the active folder, four names to a row, each name shown
+  as its 11 raw characters (8 name, 3 extension, no dot).
+- Takes no argument; anything after `DIR` is ignored.
+- An empty folder shows `NO FILES`.
+- For sizes and load addresses use the `DIR2` utility in Root.
+
+### TYPE
+
+    TYPE <file>
+
+- Lists a text file on the console, stopping at end of file or at `^Z`.
+- Pauses every 22 lines (`PGLINE`) and waits for a key:
+  - **Space** — the next page;
+  - **Enter** — the rest of the file without pausing;
+  - **Esc** or **^C** — stop.
+- A missing file shows `NO FILES`; no name gives `--Parse error`.
+- Bytes are sent as they are — see Known issues for LF-only files.
 
 ### ERA
 
@@ -99,6 +122,103 @@ A leading `.` on any command line loads without running.
   never disturbed by an erase. Up to 200 files per run; if more match, ERA
   says so and you run it again.
 
+### REN
+
+    REN <old> <new>
+
+- Renames a file in the active folder. Both names must be exact.
+- `?File not found` — the old name does not exist.
+- `?Name already in use` — the new name is taken.
+- Refuses a `.SYS` or `.SHC` file as either name, and wildcards
+  (`--REN needs exact names, no wildcards`).
+- A missing name gives `--Parse error`.
+
+### COPY
+
+    COPY <src> <dst>
+    COPY TEST.C T2.C
+    COPY [TOOLS]LANGTEST.C LT.C
+    COPY DIR2.COM [TOOLS]DIR2.COM
+
+- Copies one file, sector by sector. A name without a `[FOLDER]` prefix is in
+  the current folder; `COPY [TOOLS]ABC.EXE DEF.COM` puts `DEF.COM` in the
+  current folder, not in `TOOLS`.
+- An existing destination is replaced.
+- The copy keeps the source's load address (`FLA`), type byte (`FTY`) and
+  last-record length (`LRBL`), so a copied `.COM` loads and runs like the
+  original.
+- Refuses, with a message:
+  - wildcards in either name (`?` is a real wildcard in the BDOS search);
+  - a `.SYS` or `.SHC` destination (see System file protection);
+  - a file copied onto itself — detected by both names opening to the same
+    first block, so it is caught through folders too;
+  - a missing source or folder.
+- A write or close failure erases the partial destination rather than leave a
+  truncated file.
+- The shell's current folder is restored on every exit.
+
+How it handles folders: the BDOS resolves an FCB's folder when it is called
+(FCB byte 18 `>20` means "the active folder"), so `COPY` parses both names
+first, then works on each file with its own folder active. The source is
+opened in its folder; after that its reads follow its block chain. The
+destination is checked, erased, made, written and closed in its folder — a
+Root file's folder ID is 0, which the BDOS also reads as "the active folder",
+so the destination's folder must still be active at `FCLOSE`.
+
+### SAVE
+
+    SAVE <sectors> <file> [-HHHH]
+    SAVE 8 PROG.COM
+    SAVE 16 IMAGE.COM -2000
+
+- Writes `<sectors>` 512-byte records of memory to `<file>`, starting at
+  `>0500` (the TPA) or at the hex address given with `-HHHH`.
+- The sector count is decimal and the address hex; a count of 0, or an
+  address of 0, is a parse error.
+- The start address becomes the file's load address (`FLA`), so a saved
+  `.COM` loads back where it came from.
+- An existing file of that name is replaced.
+- Stops with `--File too large error` if the data would reach `MEMLIMIT`;
+  `--Make error` or `--Write error` if the BDOS fails.
+- Refuses a `.SYS` or `.SHC` name and wildcards
+  (`--SAVE needs one exact file name, no wildcards`).
+
+### LOAD
+
+    LOAD <file>
+
+- Loads an EXE into its pages without running it — each block is listed
+  (`BLK PG:` page, address, size) as it is copied, then `Loaded as overlay`.
+- `--Load error` if the file cannot be opened or read;
+  `--EXE block overlaps shell memory` for a block at or above `>C000`.
+- Has known limitations (see Known issues).
+
+### MKDIR
+
+    MKDIR <name>
+
+- Creates a folder; the name follows the same rules as a file name.
+- `--Directory creation failed` if the BDOS refuses it; no name gives
+  `--Parse error`.
+
+### CHDIR
+
+    CHDIR <name>
+    CHDIR
+
+- Makes `<name>` the active folder and shows it in the prompt
+  (e.g. `[TOOLS]%`). `CHDIR` alone returns to Root (`%`).
+- `--Directory not found` if there is no such folder; the active folder is
+  then unchanged.
+
+### RMDIR
+
+    RMDIR <name>
+
+- Removes a folder.
+- `--RMDIR Error: Not found, in use, or not empty` if the BDOS refuses it;
+  no name gives `--Parse error`.
+
 ### System file protection
 
 `.SYS` and `.SHC` files are the shell, the BDOS and the command pages — lose
@@ -107,8 +227,9 @@ one and the next boot fails. So:
 - `ERA` never erases them, by wildcard or by full name.
 - `SAVE` never writes to one, and `REN` never renames one away or renames
   anything to one.
-- `SAVE` and `REN` refuse wildcard names, since those could reach a system
-  file indirectly.
+- `COPY` never copies over one; copying *from* one (a backup) is allowed.
+- `SAVE`, `REN` and `COPY` refuse wildcard names, since those could reach a
+  system file indirectly.
 
 System files are added or removed only by rebuilding the volume with SYSGEN.
 
@@ -120,9 +241,13 @@ Each internal command is its own source file, assembled at `AORG >D000` and
 stored on the disk as `NAME.SHC` in the Root folder. At cold start `LDCMDS`
 reads each one into its own physical page of segment D:
 
-| Page | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Command | DIR | SAVE | ERA | TYPE | LOAD | MKDIR | CHDIR | RMDIR | REN |
+| Page | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Command | DIR | SAVE | ERA | TYPE | LOAD | MKDIR | CHDIR | RMDIR | REN | COPY |
+
+A command uses only the `>D000`–`>DFFF` part of its physical page, so it does
+not conflict with an EXE's overlays, which use `>8000`–`>BFFF` of the same
+pages.
 
 A file that is missing, empty, larger than 4096 bytes, or does not start with
 `B @` is reported at boot (`--Cannot load command`) and that command is refused
@@ -144,6 +269,11 @@ on the shell's own page.
 - Never execute `PSEL_DIS` and never remap segment D.
 - Everything the page uses — code, data and `BSS` — must fit `>D000`–`>DFFF`.
   The stack is the shell's, in segment 0.
+- Anything the BDOS reads or writes — FCBs, names, sector buffers — must be
+  in common memory below `>C000`: the BDOS runs with PSEL off and cannot see
+  the page.
+- Keep nothing in registers across a BDOS call: some functions (`FCHDIR`,
+  for one) change most of R0–R8.
 - Core addresses at or above `>D000` are invisible from a page (they are in
   the shell's own page D0). `CORE.INC` does not export them, so naming one is
   an assembly error, not a silent wrong read.
@@ -172,6 +302,8 @@ This is achieved via a 256-slot Folder Alias Table located at Block 7 on the dis
 - **Removing Folders:** `RMDIR <name>` removes a folder once it is empty.
 - **Context-Aware Listings:** The `DIR` command automatically filters its output
   based on the current active folder.
+- **Copying between folders:** `COPY [TOOLS]X.C [WORK]X.C` copies a file from
+  one folder to another without changing the working directory.
 
 ### Root Fallback
 To avoid duplicating system utilities (like `XMODEM` or `FILEEDIT`) into every folder,
@@ -271,7 +403,7 @@ pages nor applications can disturb it between lines.
 
 | Folder | Contents |
 | --- | --- |
-| `SHELL/` | `SHELLV65.A99` (core), `DECLS.INC`, the nine command pages, `MAKESHELL.bat`, `sysgen.c` |
+| `SHELL/` | `SHELLV65.A99` (core), `DECLS.INC`, the ten command pages, `MAKESHELL.bat`, `sysgen.c` |
 | `MKCINC/` | the `CORE.INC` generator — built separately, `MKCINC.EXE` copied into `SHELL/` |
 | `A99/` | the A99 cross-assembler (ANSI C) with `INCL` |
 | `A99_K&R/` | the same assembler in K&R / Small C 2.2 style, for SMALLC99 on the SBC |
@@ -294,7 +426,7 @@ and `DIR2.H99` in `SHELL/`, with MinGW `gcc` on the PATH, and run:
     MAKESHELL
 
 It builds `SYSGEN`, assembles the core, generates `CORE.INC`, assembles the
-nine pages, packs the volume into `PAYLOAD65.HEX` with SYSGEN, and copies it
+ten pages, packs the volume into `PAYLOAD65.HEX` with SYSGEN, and copies it
 to `..\MONITOR`. It stops at the first error and copies nothing unless every
 step is clean. Each assembly's output is kept in `<name>.LOG`.
 
@@ -317,6 +449,9 @@ volume.
   with `-1`, but its test always falls through, so the procedure continues.
 - **`TYPE`**: sends bytes as they are; a file with LF-only line endings
   (e.g. made on Linux) displays as a staircase. Convert it to CRLF first.
+- **`COPY`**: the BDOS's `RDSEQ` returns `-1` both at end of file and on a
+  read error, so a read error part-way through ends the copy early without a
+  message. One file per command; no wildcard copies.
 - **`CMDCNT`** is maintained by hand when a command is added.
 
 ---
@@ -325,6 +460,13 @@ volume.
 
 Kept in full at the head of `SHELLV65.A99`. Recent work:
 
+- **6.5c** — `COPY` added (page 11): one file, `[FOLDER]` prefixes on either
+  name, keeps load address and type, refuses wildcards, system-file
+  destinations and a file copied onto itself. EXE loader: the 144-record block
+  log (`DBG_LOG`) and the `-D` load map are removed — the log overflowed for
+  any EXE of more than 144 blocks and overwrote shell variables. The loader
+  now works out `FREEMEM` and `MEMLIMIT` as it loads, with no block limit.
+  Core drops from `>D911` to `>D358` (1,474 bytes returned).
 - **6.5b** — System file protection: `ERA`, `SAVE` and `REN` never erase,
   overwrite or rename `.SYS`/`.SHC`, and `SAVE`/`REN` refuse wildcards.
   `SAVE` now detects a failed make or write.
